@@ -1,31 +1,54 @@
+// bridges to call Rust commands from JavaScript
 const { invoke } = window.__TAURI__.core;
 
+
+// ********
+// this block of code can be deleted, its just boilerplate to test calling rust commands
+// but its a good example of how a call to rust works
 let greetInputEl;
 let greetMsgEl;
-
+greetInputEl = document.querySelector("#greet-input");
+greetMsgEl = document.querySelector("#greet-msg");
+document.querySelector("#greet-form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  greet();
+});
 async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
   greetMsgEl.textContent = await invoke("greet", { name: greetInputEl.value });
 }
+// ********
 
-window.addEventListener("DOMContentLoaded", async () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
-  document.querySelector("#greet-form").addEventListener("submit", (e) => {
-    e.preventDefault();
-    greet();
-  });
 
+
+/**
+ * Calls Rust function `user_exists` to query the database if a user exists.
+ *
+ * @returns {boolean} true if user exists, false otherwise
+ */
+async function userExists(){
+
+  console.log("Checking if user exists...");
   try {
-   
-    console.log("inserting person...")
-    await invoke("add_person", { name: "Steven" });
 
-    
-    const people = await invoke("list_people");
-    console.log("People in DB:", people);
+    const userExists = await invoke("user_exists"); // invoke rust command
+    console.log("User exists:", userExists);
+    return userExists;
+
   } catch (err) {
-    console.error("DB error:", err);
-  }
 
+    console.log("Error checking user existence:", err);
+    return false;
+  
+  }
+}
+
+// this is immediately called when the web page is loaded
+window.addEventListener("DOMContentLoaded", async () => {
+
+  // check if a user even exists
+  // if not, redirect to create password/vault page
+  const exists = await userExists();
+  if (!exists){
+    // window.location.replace("create.html");
+  } 
 });

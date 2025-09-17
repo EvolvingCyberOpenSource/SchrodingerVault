@@ -9,7 +9,7 @@ pub fn db_path(app: &tauri::AppHandle) -> PathBuf {
         .expect("failed to resolve AppData path")
 }
 
-/// open the database and create schema if needed
+/// open the database and create schema if needed returing a connection object
 pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
     let path = db_path(app);
 
@@ -29,6 +29,17 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
            name  TEXT NOT NULL,
            data  BLOB
          )",
+        [],
+    )?;
+
+    // table for the user (only 1 user allowed)
+    // this table is the WRONG schema, will be deleted
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS user (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            password_hash   TEXT    NOT NULL,
+            salt            BLOB    NOT NULL
+            )",
         [],
     )?;
 
