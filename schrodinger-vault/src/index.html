@@ -12,12 +12,26 @@
 
     <main id="page-home" class="container">
       <h1>Schrodinger's Vault</h1>
-
+      <!--DEMO STUFF-->
       <form class="row" id="greet-form">
         <input id="greet-input" placeholder="Enter a name..." />
         <button type="submit">Greet</button>
       </form>
       <p id="greet-msg"></p>
+      <!-------------->
+
+      <!-- Add entry form -->
+      <form id="add-entry" class="add-form">
+        <input id="label" placeholder="Label" required />
+        <input id="username" placeholder="Username" required />
+        <input id="password" type="password" placeholder="Password" required />
+        <textarea id="notes" placeholder="Notes (optional)"></textarea>
+        <button type="submit">Add</button>
+      </form>
+
+      <!-- List entries -->
+      <div id="entry-list" class="entry-list"></div>
+
     </main>
 
 
