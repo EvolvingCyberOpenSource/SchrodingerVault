@@ -27,7 +27,8 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::greet,
             commands::add_person,
             commands::list_people,
-            commands::user_exists
+            commands::user_exists,
+            commands::create_vault
         ])
 }
 

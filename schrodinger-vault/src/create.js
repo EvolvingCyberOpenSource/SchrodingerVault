@@ -32,21 +32,22 @@ function validatePassword(password, confirmPassword) {
  *
  * @returns {void}
  */
-document.querySelector("#create-form").addEventListener("submit", async (e) => {
+document.querySelector("#passwordForm").addEventListener("submit", async (e) => {
     e.preventDefault();
 
     const password = document.querySelector("#masterPassword").value;
     const confirmPassword = document.querySelector("#confirmPassword").value;
 
     // validate password
-    const validated = validatePassword(password, confirmPassword);
-    if (!validated) {
-      return;
-    }
+    // const validated = validatePassword(password, confirmPassword);
+    // if (!validated) {
+    //   return;
+    // }
 
     //TODO: hash password with salt and store in database
     // We still have t
 
-
+    console.log("password entered: ", password)
+    await invoke("create_vault", { masterPassword: password });
 
 });

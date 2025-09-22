@@ -43,5 +43,14 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
         [],
     )?;
 
+    // might want to change value to BLOB
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
+
     Ok(conn)
 }

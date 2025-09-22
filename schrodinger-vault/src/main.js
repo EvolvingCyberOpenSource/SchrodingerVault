@@ -19,6 +19,16 @@ async function greet() {
 // ********
 
 
+function listEntries(){
+
+  // make a call to the commands.rs that queries the database for all entries
+  // it returns a list of them
+  // in a loop you would add them to the html div
+
+
+
+}
+
 
 /**
  * Calls Rust function `user_exists` to query the database if a user exists.
@@ -49,6 +59,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   // if not, redirect to create password/vault page
   const exists = await userExists();
   if (!exists){
-    // window.location.replace("create.html");
+    window.location.replace("create.html");
   } 
 });
