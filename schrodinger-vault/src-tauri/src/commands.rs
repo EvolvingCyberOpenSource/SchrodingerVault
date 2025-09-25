@@ -7,6 +7,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
+use oqs;
 
 // default teast command
 #[command]
@@ -89,6 +90,9 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
     );
 
     // TODO: device secret part starts here
+    let _ = generate_device_keypair();
+
+    let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768);
 
     // storing both salts and kdf and params in meta table as their own entires
     // currenttly we are doing INSERT OR REPLACE so final version should remove replace option
@@ -118,4 +122,13 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
     println!("(debug) salts and kdf info stored in meta table, returning...");
 
     Ok(true)
+}
+
+// private function for generating the device keypair
+fn generate_device_keypair() -> oqs::Result<()> {
+    oqs::init();
+    let kem = oqs::kem:: Kem::new(oqs::kem::Algorithm::MlKem768)?;
+    let (pk_kem, sk_kem) = kem.keypair()?;
+    let (ct_kem, ss) = kem.encapsulate(&pk_kem)?;
+    Ok(())
 }
