@@ -322,9 +322,9 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
 pub fn debug_reset_vault_hard(db: State<AppDb>) -> Result<bool, String> {
     debug_reset_vault_soft(db.clone())?;
 
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    // make this mutable ↓↓↓
+    let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    // If your table is named differently, change this.
     let _ = tx.execute("DELETE FROM entries", []);
     tx.commit().map_err(|e| e.to_string())?;
 
