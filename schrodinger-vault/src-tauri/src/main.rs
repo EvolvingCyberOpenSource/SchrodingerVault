@@ -29,6 +29,10 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::list_people,
             commands::user_exists,
             commands::create_vault
+            commands::debug_kem_status,
+            commands::debug_dump_meta,
+            commands::debug_reset_vault_soft,
+            commands::debug_reset_vault_hard,
         ])
 }
 

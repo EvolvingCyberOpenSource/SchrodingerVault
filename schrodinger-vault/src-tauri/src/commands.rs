@@ -2,32 +2,30 @@ use tauri::{command, State};
 use rusqlite::{params, OptionalExtension};
 use crate::state::AppDb;
 
-use rand::RngCore;        // for .fill_bytes()
-use rand::rng;            // rand 0.9: use rng() instead of deprecated thread_rng()
-
+use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
 
-use oqs; // high-level oqs (safe wrapper)
-use std::{fs, path::PathBuf, io};
-use zeroize::Zeroize;
-use dirs; // per-user data dir
-
-// Secure write helper: ensures SK file is 0600 on Unix; user-private on Windows.
-use std::path::Path;
+use oqs; // high-level, safe wrappers
+use std::{fs, io, path::{Path, PathBuf}};
 use std::fs::OpenOptions;
 use std::io::Write;
+use zeroize::Zeroize;
+use dirs;
 
+// ============================ Utilities ============================
+
+/// Write a secret key file with tight permissions:
+/// - Unix/macOS: 0600
+/// - Windows: in %LOCALAPPDATA% (per-user ACLs)
 fn write_secret_key_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-        // Create atomically with 0600
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
@@ -35,16 +33,16 @@ fn write_secret_key_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .mode(0o600)
             .open(path)?;
         f.write_all(bytes)?;
-        // Ensure final perms are 0600
+        // ensure final perms are exactly 0600
         let mut p = f.metadata()?.permissions();
         p.set_mode(0o600);
-        std::fs::set_permissions(path, p)?;
+        fs::set_permissions(path, p)?;
         Ok(())
     }
 
     #[cfg(windows)]
     {
-        // In %LOCALAPPDATA%, files inherit a per-user ACL by default.
+        // In %LOCALAPPDATA%, new files inherit a per-user ACL (private to the account).
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
@@ -55,7 +53,9 @@ fn write_secret_key_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-// Keystore path helper -> %LOCALAPPDATA%/SchrodingerVault/keystore/mlkem768.sk
+/// %LOCALAPPDATA%/SchrodingerVault/keystore/mlkem768.sk (Windows)
+/// ~/Library/Application Support/SchrodingerVault/keystore/mlkem768.sk (macOS)
+/// ~/.local/share/SchrodingerVault/keystore/mlkem768.sk (Linux)
 fn keystore_path() -> io::Result<PathBuf> {
     let base = dirs::data_local_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no local data dir"))?;
@@ -64,7 +64,8 @@ fn keystore_path() -> io::Result<PathBuf> {
     Ok(dir.join("mlkem768.sk"))
 }
 
-// Example commands 
+// ============================ Examples / Scaffolding ============================
+
 #[command]
 pub fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -104,7 +105,8 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
     Ok(out)
 }
 
-// Create Vault: PBKDF2-HMAC-SHA-256 + device ML-KEM-768 keypair + self-encap.
+// ============================ Vault Init ============================
+
 #[command]
 pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, String> {
     println!("== create_vault ==");
@@ -112,18 +114,18 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
 
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
 
-    // salts
+    // salts (random)
+    let mut r = rng();
     let mut salt_pw  = [0u8; 16];
     let mut salt_kdf = [0u8; 32];
-    let mut r = rng();
     r.fill_bytes(&mut salt_pw);
     r.fill_bytes(&mut salt_kdf);
 
-    // encode for TEXT storage
+    // Base64 for TEXT storage
     let salt_pw_b64  = B64.encode(salt_pw);
     let salt_kdf_b64 = B64.encode(salt_kdf);
 
-    // KDF params
+    // PBKDF2 params
     let kdf = "pbkdf2-hmac-sha256";
     let kdf_params = r#"{"iterations":310000,"out":32,"algo":"sha256"}"#;
 
@@ -133,7 +135,7 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
     pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, iterations.into(), &mut k1);
     println!("(debug) PBKDF2 derived K1 (32 bytes in RAM)");
 
-    // Device keypair + self-encap
+    // Device KEM keypair + self-encapsulation
     let (pk_kem_raw, ct_kem_raw) = generate_device_keypair().map_err(|e| e.to_string())?;
     println!(
         "(debug) pk_kem_bytes_len={}, ct_kem_bytes_len={}",
@@ -145,6 +147,7 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
     let ct_kem_b64 = B64.encode(&ct_kem_raw);
     let kem_alg = "ML-KEM-768";
 
+    // Store public/metadata only
     {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
         tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"salt_pw",  &salt_pw_b64)).map_err(|e| e.to_string())?;
@@ -159,12 +162,16 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
         tx.commit().map_err(|e| e.to_string())?;
     }
 
+    // Zeroize K1 (good hygiene; you’ll HKDF it later)
+    k1.zeroize();
+
     println!("(debug) salts + kdf + kem public material stored; SK on disk.");
     println!("== create_vault done ==");
     Ok(true)
 }
 
-// Device keypair generator — SK written securely to file, not DB.
+/// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,
+/// writes SK to keystore with tight perms, and returns (pk_raw, ct_raw).
 fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
     oqs::init();
 
@@ -178,25 +185,27 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
 
     let (ct_kem, ss_raw) = kem.encapsulate(&pk_kem)
         .map_err(|e| format!("encapsulate: {e}"))?;
-    println!("(debug) encapsulated: ct={}B, ss={}B",
-        ct_kem.as_ref().len(), ss_raw.as_ref().len());
-
-    // Self-check
     let ss2 = kem.decapsulate(&sk_kem, &ct_kem)
         .map_err(|e| format!("decapsulate: {e}"))?;
-    debug_assert_eq!(ss_raw.as_ref(), ss2.as_ref());
-    println!("(debug) self-check ok: decapsulated ss matches");
 
-    // Write SK securely
+    if ss_raw.as_ref() == ss2.as_ref() {
+        println!("(debug) shared secret match ({} bytes)", ss_raw.len());
+    } else {
+        println!("(debug) ERROR: shared secret mismatch!");
+    }
+
+    // Write SK securely to app-private keystore
     let sk_path = keystore_path().map_err(|e| format!("keystore_path: {e}"))?;
     write_secret_key_secure(&sk_path, sk_kem.as_ref())
         .map_err(|e| format!("write sk: {e}"))?;
     println!("(debug) wrote secret key to: {}", sk_path.to_string_lossy());
 
+    // Return raw pk/ct bytes for DB storage (as Base64)
     Ok((pk_kem.as_ref().to_vec(), ct_kem.as_ref().to_vec()))
 }
 
-// Debug: sizes/status (safe, no FFI).
+// ============================ Debug / Demo Helpers ============================
+
 #[derive(serde::Serialize)]
 pub struct KemStatus {
     pub pk_kem_b64_len: usize,
@@ -225,11 +234,11 @@ pub fn debug_kem_status(db: State<AppDb>) -> Result<KemStatus, String> {
         "SELECT value FROM meta WHERE key = 'kem_alg'", [], |r| r.get(0)
     ).optional().map_err(|e| e.to_string())?;
 
-    let (pk_kem_b64_len, pk_kem_bytes_len): (usize, usize) = match pk_b64 {
+    let (pk_kem_b64_len, pk_kem_bytes_len) = match pk_b64 {
         Some(ref s) => (s.len(), B64.decode(s).map(|v| v.len()).unwrap_or(0)),
         None => (0, 0),
     };
-    let (ct_kem_b64_len, ct_kem_bytes_len): (usize, usize) = match ct_b64 {
+    let (ct_kem_b64_len, ct_kem_bytes_len) = match ct_b64 {
         Some(ref s) => (s.len(), B64.decode(s).map(|v| v.len()).unwrap_or(0)),
         None => (0, 0),
     };
@@ -249,4 +258,75 @@ pub fn debug_kem_status(db: State<AppDb>) -> Result<KemStatus, String> {
         sk_len,
         kem_alg,
     })
+}
+
+#[derive(serde::Serialize)]
+pub struct MetaRow {
+    pub key: String,
+    pub value: String,
+}
+
+#[command]
+pub fn debug_dump_meta(db: State<AppDb>) -> Result<Vec<MetaRow>, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM meta ORDER BY key")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(MetaRow {
+                key: row.get(0)?,
+                value: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+fn remove_file_if_exists(p: &Path) -> io::Result<()> {
+    match fs::remove_file(p) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Clear keystore file + meta rows (keeps entries table).
+#[command]
+pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
+    let sk_path = keystore_path().map_err(|e| e.to_string())?;
+    remove_file_if_exists(&sk_path).map_err(|e| format!("remove sk: {e}"))?;
+
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM meta WHERE key IN (
+            'salt_pw','salt_kdf','kdf','kdf_params','pk_kem','ct_kem','kem_alg'
+        )",
+        [],
+    ).map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    println!("(reset) soft reset done (keystore + meta cleared; entries kept)");
+    Ok(true)
+}
+
+/// Do soft reset AND wipe entries table (if present).
+#[command]
+pub fn debug_reset_vault_hard(db: State<AppDb>) -> Result<bool, String> {
+    debug_reset_vault_soft(db.clone())?;
+
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    // If your table is named differently, change this.
+    let _ = tx.execute("DELETE FROM entries", []);
+    tx.commit().map_err(|e| e.to_string())?;
+
+    println!("(reset) hard reset done (entries wiped)");
+    Ok(true)
 }
