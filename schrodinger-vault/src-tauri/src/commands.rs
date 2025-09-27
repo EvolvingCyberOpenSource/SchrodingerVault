@@ -302,7 +302,8 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
     let sk_path = keystore_path().map_err(|e| e.to_string())?;
     remove_file_if_exists(&sk_path).map_err(|e| format!("remove sk: {e}"))?;
 
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    // make this mutable ↓↓↓
+    let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM meta WHERE key IN (
