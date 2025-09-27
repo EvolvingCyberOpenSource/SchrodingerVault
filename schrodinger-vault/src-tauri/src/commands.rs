@@ -353,3 +353,193 @@ pub fn debug_reset_vault_hard(db: State<AppDb>) -> Result<bool, String> {
     println!("(reset) hard reset done (entries wiped)");
     Ok(true)
 }
+
+#[derive(serde::Serialize)]
+pub struct NoAesInMeta {
+    pub suspicious_keys_found: Vec<String>,
+}
+
+/// Convenience check that your meta table does not hold AES/HKDF material.
+/// Returns the list of suspicious keys it found (usually empty).
+#[command]
+pub fn debug_check_no_aes_in_meta(db: State<AppDb>) -> Result<NoAesInMeta, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let suspects = ["aes_key", "vault_key", "hkdf", "ikm"];
+    let mut found = Vec::new();
+    for k in suspects {
+        let hit: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key=?1", [k], |r| r.get(0))
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if hit.is_some() {
+            found.push(k.to_string());
+        }
+    }
+    Ok(NoAesInMeta { suspicious_keys_found: found })
+}
+
+#[derive(serde::Serialize)]
+pub struct HkdfStep5ZeroizeDemo {
+    pub k1_before_b64: String,
+    pub k1_after_b64: String,
+    pub ss_before_b64: String,
+    pub ss_after_b64: String,
+    pub ikm_before_len: usize,
+    pub ikm_after_all_zero: bool,
+    pub aes_before_b64: String,
+    pub aes_after_b64: String,
+}
+
+/// Demo helper: derive K1 and ss, blend with HKDF, show Base64 before/after zeroize.
+/// For demo only — do not keep in production.
+#[derive(serde::Serialize)]
+pub struct ZeroizePrintResult {
+    pub k1_len: usize,
+    pub ss_len: usize,
+    pub ikm_len: usize,
+    pub aes_len: usize,
+    pub k1_nonzero_before: usize,
+    pub ss_nonzero_before: usize,
+    pub ikm_nonzero_before: usize,
+    pub aes_nonzero_before: usize,
+    pub k1_zeroized: bool,
+    pub ss_zeroized: bool,
+    pub ikm_zeroized: bool,
+    pub aes_zeroized: bool,
+}
+
+fn count_nonzero(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|&&b| b != 0).count()
+}
+
+fn hex4(bytes: &[u8]) -> String {
+    // tiny, redacted preview of the first 4 bytes for visual confirmation
+    let take = bytes.iter().take(4);
+    let mut s = String::new();
+    for b in take { use std::fmt::Write; let _ = write!(s, "{:02x}", b); }
+    s
+}
+
+/// Prints before/after status around Step 5 zeroization; asserts (returns Err) if any buffer
+/// is not fully zeroized afterwards. For demo only.
+#[command]
+pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> Result<ZeroizePrintResult, String> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    println!("== debug_step5_zeroize_print ==");
+
+    // load salts from DB
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let salt_pw_b64: String = conn.query_row(
+        "SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get(0)
+    ).map_err(|_| "salt_pw missing")?;
+    let salt_kdf_b64: String = conn.query_row(
+        "SELECT value FROM meta WHERE key='salt_kdf'", [], |r| r.get(0)
+    ).map_err(|_| "salt_kdf missing")?;
+
+    let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode")?;
+    let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
+
+    // derive K1 (RAM only)
+    let mut k1 = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
+
+    // obtain ss
+    // Path A: FFI decapsulation using stored ct+sk (enable with --features ffi-decap)
+    #[cfg(feature = "ffi-decap")]
+    let ss_raw: Vec<u8> = {
+        use oqs_sys as oqsffi;
+        let ct_b64: String = conn.query_row(
+            "SELECT value FROM meta WHERE key='ct_kem'", [], |r| r.get(0)
+        ).map_err(|_| "ct_kem missing")?;
+        let ct_bytes = B64.decode(&ct_b64).map_err(|_| "ct_kem decode")?;
+        let sk_path = keystore_path().map_err(|e| e.to_string())?;
+        let sk_bytes = std::fs::read(&sk_path).map_err(|_| "sk missing")?;
+        unsafe {
+            let kem = oqsffi::kem::OQS_KEM_ml_kem_768_new();
+            if kem.is_null() { return Err("ffi kem new failed".into()); }
+            let mut ss = vec![0u8; 32];
+            let rc = oqsffi::kem::OQS_KEM_decaps(
+                kem,
+                ss.as_mut_ptr(),
+                ct_bytes.as_ptr(),
+                sk_bytes.as_ptr()
+            );
+            oqsffi::kem::OQS_KEM_free(kem);
+            if rc != oqsffi::common::OQS_STATUS_OQS_SUCCESS {
+                return Err("ffi decapsulation failed".into());
+            }
+            ss
+        }
+    };
+
+    // Path B: fallback (no FFI) — make an ephemeral keypair and encapsulate
+    #[cfg(not(feature = "ffi-decap"))]
+    let ss_raw: Vec<u8> = {
+        oqs::init();
+        let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768)
+            .map_err(|e| format!("kem new: {e}"))?;
+        let (pk, _) = kem.keypair().map_err(|e| format!("keypair: {e}"))?;
+        let (_ct, ss) = kem.encapsulate(&pk).map_err(|e| format!("encaps: {e}"))?;
+        ss.as_ref().to_vec()
+    };
+
+    // IKM = K1 || ss
+    let mut ikm = Vec::with_capacity(64);
+    ikm.extend_from_slice(&k1);
+    ikm.extend_from_slice(&ss_raw);
+
+    // HKDF -> AES-256 key (RAM only)
+    let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
+    let mut aes_key = [0u8; 32];
+    hk.expand(b"vault-key", &mut aes_key).map_err(|_| "HKDF expand failed")?;
+
+    // BEFORE: print non-secret diagnostics (lengths + nonzero counts + tiny preview)
+    let k1_nonzero_before  = count_nonzero(&k1);
+    let ss_nonzero_before  = count_nonzero(&ss_raw);
+    let ikm_nonzero_before = count_nonzero(&ikm);
+    let aes_nonzero_before = count_nonzero(&aes_key);
+    println!("[before] K1: len=32 nonzero={} preview={}..", k1_nonzero_before, hex4(&k1));
+    println!("[before] SS: len={} nonzero={} preview={}..", ss_raw.len(), ss_nonzero_before, hex4(&ss_raw));
+    println!("[before] IKM: len={} nonzero={}", ikm.len(), ikm_nonzero_before);
+    println!("[before] AES: len=32 nonzero={} preview={}..", aes_nonzero_before, hex4(&aes_key));
+
+    // ZEROIZE
+    k1.zeroize();
+    let mut ss_mut = ss_raw.clone();
+    ss_mut.zeroize();
+    ikm.zeroize();
+    aes_key.zeroize();
+
+    // AFTER: verify zeroization
+    let k1_zeroized  = k1.iter().all(|&b| b == 0);
+    let ss_zeroized  = ss_mut.iter().all(|&b| b == 0);
+    let ikm_zeroized = ikm.iter().all(|&b| b == 0);
+    let aes_zeroized = aes_key.iter().all(|&b| b == 0);
+
+    println!("[after]  K1 zeroized={}", k1_zeroized);
+    println!("[after]  SS zeroized={}", ss_zeroized);
+    println!("[after]  IKM zeroized={}", ikm_zeroized);
+    println!("[after]  AES zeroized={}", aes_zeroized);
+
+    // Hard fail if any didn’t zeroize (handy during demo)
+    if !(k1_zeroized && ss_zeroized && ikm_zeroized && aes_zeroized) {
+        return Err("zeroize check failed (one or more buffers not cleared)".into());
+    }
+
+    Ok(ZeroizePrintResult {
+        k1_len: 32,
+        ss_len: 32,
+        ikm_len: 64,
+        aes_len: 32,
+        k1_nonzero_before,
+        ss_nonzero_before,
+        ikm_nonzero_before,
+        aes_nonzero_before,
+        k1_zeroized,
+        ss_zeroized,
+        ikm_zeroized,
+        aes_zeroized,
+    })
+}

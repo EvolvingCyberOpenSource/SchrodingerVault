@@ -33,6 +33,8 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_dump_meta,
             commands::debug_reset_vault_soft,
             commands::debug_reset_vault_hard,
+            commands::debug_check_no_aes_in_meta,
+            commands::debug_step5_zeroize_print,
         ])
 }
 
