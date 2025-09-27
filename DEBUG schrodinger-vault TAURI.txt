@@ -1,0 +1,58 @@
+DEBUG schrodinger-vault TAURI PROJECT Commands USE IN DevTools Console also allow pasting:
+
+
+Example Demo Flow
+
+run soft reset:
+
+await window.__TAURI__.core.invoke('debug_reset_vault_soft')
+
+
+Run hard reset:
+
+await window.__TAURI__.core.invoke('debug_reset_vault_hard')
+
+
+
+
+Re-create:
+
+await window.__TAURI__.core.invoke('create_vault', { masterPassword: 'demo1234!' })
+
+
+Check DB contents:
+
+await window.__TAURI__.core.invoke('debug_dump_meta')
+
+
+Check status:
+
+await window.__TAURI__.core.invoke('debug_kem_status')
+
+
+Extra “RAM-only” proof: DB does NOT have key material
+
+await window.__TAURI__.core.invoke('debug_check_no_aes_in_meta')
+
+
+Step 5 self-test: re-derive and report booleans/lengths (RAM-only)
+
+await window.__TAURI__.core.invoke('debug_step5_zeroize_print', { masterPassword: 'demo1234!' })
+
+
+verify DB file
+
+await window.__TAURI__.core.invoke('debug_db_path')
+
+
+verify AES key is loaded in RAM
+
+await window.__TAURI__.core.invoke('debug_vault_key_status')
+
+
+
+
+
+
+
+

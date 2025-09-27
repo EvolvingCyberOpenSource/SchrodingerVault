@@ -1,8 +1,12 @@
 use tauri::{command, State};
 use rusqlite::{params, OptionalExtension};
 use crate::state::AppDb;
+use crate::vault_core::db::db_path;
+use tauri::AppHandle;
+use std::mem;
 
-use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes
+use rand::{rng, RngCore}; // ran
+// d 0.9: rng() + RngCore::fill_bytes
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
@@ -14,10 +18,15 @@ use oqs; // high-level, safe wrappers
 use std::{fs, io, path::{Path, PathBuf}};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::sync::OnceLock; // hold AES_KEY in RAM for the session
 use zeroize::Zeroize;
 use dirs;
 
-// ============================ Utilities ============================
+// AES-256 vault key lives only in RAM for this process lifetime.
+// We never serialize this; app restart -> key is gone until user logs in again.
+static VAULT_AES_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+//Utilities
 
 /// Write a secret key file with tight permissions:
 /// - Unix/macOS: 0600
@@ -65,7 +74,83 @@ fn keystore_path() -> io::Result<PathBuf> {
     Ok(dir.join("mlkem768.sk"))
 }
 
-// ============================ Examples / Scaffolding ============================
+/// %APPDATA%/SchrodingerVault/vault.sqlite (Windows, roaming)
+/// ~/Library/Application Support/SchrodingerVault/vault.sqlite (macOS)
+/// ~/.local/share/SchrodingerVault/vault.sqlite (Linux)
+fn vault_db_path() -> io::Result<PathBuf> {
+    let base = dirs::data_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no roaming data dir"))?;
+    let dir = base.join("SchrodingerVault");
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join("vault.sqlite"))
+}
+
+/// Create the DB file if missing and set private perms.
+/// On Unix: 0600. On Windows: rely on per-user ACL in %APPDATA%.
+fn ensure_vault_db_file() -> io::Result<PathBuf> {
+    let p = vault_db_path()?;
+
+    if !p.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let _f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .mode(0o600)
+                .open(&p)?;
+            let mut perm = fs::metadata(&p)?.permissions();
+            perm.set_mode(0o600);
+            fs::set_permissions(&p, perm)?;
+        }
+        #[cfg(windows)]
+        {
+            // Creating in %APPDATA% gives a per-user ACL by default.
+            let _f = OpenOptions::new().create(true).write(true).open(&p)?;
+        }
+    }
+
+    Ok(p)
+}
+
+/// Ensure the on-disk DB exists and schema is present; used after a hard reset.
+/// Uses the app-scoped db_path for exact location and applies schema to the live connection.
+fn ensure_db_on_disk(app: &AppHandle, db: &State<AppDb>) -> Result<(), String> {
+    let p = db_path(app);
+    if !p.exists() {
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create db dir: {e}"))?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&p)
+            .map_err(|e| format!("touch db: {e}"))?;
+
+        let schema = r#"
+            PRAGMA journal_mode = WAL;
+            CREATE TABLE IF NOT EXISTS meta (
+              key   TEXT PRIMARY KEY,
+              value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS entries (
+              id          INTEGER PRIMARY KEY AUTOINCREMENT,
+              label       TEXT NOT NULL,
+              username    TEXT,
+              nonce       BLOB NOT NULL,        -- 12 bytes (AES-GCM)
+              ciphertext  BLOB NOT NULL,        -- sealed data
+              created_at  INTEGER NOT NULL,     -- unix epoch (seconds)
+              updated_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_entries_label ON entries(label);
+        "#;
+        let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        conn.execute_batch(schema).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// previous Examples
 
 #[command]
 pub fn greet(name: &str) -> String {
@@ -74,7 +159,7 @@ pub fn greet(name: &str) -> String {
 
 #[derive(serde::Serialize)]
 pub struct Person { pub id: i32, pub name: String }
-
+// load commands for db 
 #[command]
 pub fn add_person(db: State<AppDb>, name: String) -> Result<(), String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -106,12 +191,67 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
     Ok(out)
 }
 
-// ============================ Vault Init ============================
+// Vault Storage Init (Step 6/7) 
+
+/// Create the vault DB file with private perms and ensure tables exist.
+#[command]
+pub fn init_vault_storage(app: AppHandle, db: State<AppDb>) -> Result<String, String> {
+    // === FIX: Use the same tauri-scoped DB path everywhere and bind live connection to it ===
+    let p = db_path(&app);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create db dir: {e}"))?;
+    }
+
+    // Open a temporary connection for migrations.
+    let conn = rusqlite::Connection::open(&p).map_err(|e| e.to_string())?;
+
+    conn.pragma_update(None, "journal_mode", &"WAL").map_err(|e| e.to_string())?;
+    conn.pragma_update(None, "synchronous", &"NORMAL").map_err(|e| e.to_string())?;
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS entries (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            label       TEXT NOT NULL,
+            username    TEXT,
+            nonce       BLOB NOT NULL,         -- 12 bytes (AES-GCM)
+            ciphertext  BLOB NOT NULL,         -- sealed data
+            created_at  INTEGER NOT NULL,      -- unix epoch (seconds)
+            updated_at  INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_entries_label ON entries(label);
+        "#
+    ).map_err(|e| e.to_string())?;
+
+    // === FIX: swap the live AppDb connection to this on-disk file ===
+    {
+        let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let _old = std::mem::replace(&mut *guard, conn);
+        // _old drops here
+    }
+
+    Ok(format!("vault DB ready at {}", p.to_string_lossy()))
+}
+
+// Vault Init (Step 5 blended into Step 6/7)
 
 #[command]
-pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, String> {
+pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
     println!("== create_vault ==");
     println!("(debug) received password len = {}", master_password.len());
+
+    // ensure db file exists (recreate after hard reset)
+    ensure_db_on_disk(&app, &db)?;
+
+    // Ensure DB file and tables exist before we write meta.
+    // === FIX: also ensures the live connection is bound to the file ===
+    let _ = init_vault_storage(app.clone(), db.clone())?;
 
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
 
@@ -151,16 +291,19 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
     ikm.extend_from_slice(&ss_buf);
 
     let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
-    let mut aes_key = [0u8; 32];
-    hk.expand(b"vault-key", &mut aes_key)
+    let mut aes_key_tmp = [0u8; 32];
+    hk.expand(b"vault-key", &mut aes_key_tmp)
         .map_err(|_| "HKDF expand failed")?;
     println!("(debug) derived AES-256 key (32 bytes) in RAM");
 
-    // Zeroize sensitive inputs immediately
+    // Install AES key into process RAM for this session.
+    // If it's already set (vault already opened), we won't overwrite it.
+    let _ = VAULT_AES_KEY.set(aes_key_tmp);
+
+    // Zeroize sensitive inputs immediately (K1, ss, IKM only; AES stays in RAM)
     k1.zeroize();
     ss_buf.zeroize();
     ikm.zeroize();
-    aes_key.zeroize();
 
     // Base64 for TEXT meta
     let pk_kem_b64 = B64.encode(&pk_kem_raw);
@@ -178,6 +321,11 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
         tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"pk_kem", &pk_kem_b64)).map_err(|e| e.to_string())?;
         tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"ct_kem", &ct_kem_b64)).map_err(|e| e.to_string())?;
         tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"kem_alg", kem_alg)).map_err(|e| e.to_string())?;
+
+        // algorithm label string for the vault (public)
+        let alg = "mlkem768|aes256gcm|hkdfsha256|pbkdf2";
+        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"alg", alg))
+          .map_err(|e| e.to_string())?;
 
         tx.commit().map_err(|e| e.to_string())?;
     }
@@ -218,7 +366,7 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
         .map_err(|e| format!("write sk: {e}"))?;
     println!("(debug) wrote secret key to: {}", sk_path.to_string_lossy());
 
-    // Return raw pk/ct bytes + ss (RAM-only; caller will zeroize ss)
+    // Return raw pk/ct bytes + ss (RAM-only; caller will zeroize/retain as needed)
     Ok((
         pk_kem.as_ref().to_vec(),
         ct_kem.as_ref().to_vec(),
@@ -226,7 +374,7 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     ))
 }
 
-// ============================ Debug / Demo Helpers ============================
+// Debug / Demo Helpers 
 
 #[derive(serde::Serialize)]
 pub struct KemStatus {
@@ -329,7 +477,7 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM meta WHERE key IN (
-            'salt_pw','salt_kdf','kdf','kdf_params','pk_kem','ct_kem','kem_alg'
+            'salt_pw','salt_kdf','kdf','kdf_params','pk_kem','ct_kem','kem_alg','alg'
         )",
         [],
     ).map_err(|e| e.to_string())?;
@@ -340,27 +488,53 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
 }
 
 /// Do soft reset AND wipe entries table (if present).
+/// Optionally delete the DB file itself for a full reset.
 #[command]
-pub fn debug_reset_vault_hard(db: State<AppDb>) -> Result<bool, String> {
+pub fn debug_reset_vault_hard(app: AppHandle, db: State<AppDb>) -> Result<bool, String> {
+    // 1) do the soft reset (clears meta + deletes keystore)
     debug_reset_vault_soft(db.clone())?;
 
-    // make this mutable ↓↓↓
-    let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let _ = tx.execute("DELETE FROM entries", []);
-    tx.commit().map_err(|e| e.to_string())?;
+    // 2) wipe entries table
+    {
+        let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let _ = tx.execute("DELETE FROM entries", []);
+        tx.commit().map_err(|e| e.to_string())?;
+    }
 
-    println!("(reset) hard reset done (entries wiped)");
+    // 3) swap live connection to in-memory to release file locks, then delete file
+    {
+        let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let tmp = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let _old = mem::replace(&mut *guard, tmp);
+        // _old drops here, releasing any file handles
+    }
+
+    let p = db_path(&app);
+    if p.exists() {
+        if let Err(e) = std::fs::remove_file(&p) {
+            eprintln!("(reset) failed to remove DB file {}: {}", p.display(), e);
+        } else {
+            println!("(reset) removed vault database file at {}", p.display());
+        }
+    } else {
+        println!("(reset) db file already missing");
+    }
+
+    // === FIX: Recreate DB file + schema and rebind live connection to it ===
+    let _ = init_vault_storage(app.clone(), db.clone())?;
+
+    println!("(reset) hard reset done (entries wiped, keystore removed, meta cleared, db file removed)");
     Ok(true)
 }
 
+
+// Extra “RAM-only” proof: DB does NOT have key material
 #[derive(serde::Serialize)]
 pub struct NoAesInMeta {
     pub suspicious_keys_found: Vec<String>,
 }
 
-/// Convenience check that your meta table does not hold AES/HKDF material.
-/// Returns the list of suspicious keys it found (usually empty).
 #[command]
 pub fn debug_check_no_aes_in_meta(db: State<AppDb>) -> Result<NoAesInMeta, String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -378,6 +552,7 @@ pub fn debug_check_no_aes_in_meta(db: State<AppDb>) -> Result<NoAesInMeta, Strin
     Ok(NoAesInMeta { suspicious_keys_found: found })
 }
 
+// Step 5 self-test: re-derive and report booleans/lengths (RAM-only)
 #[derive(serde::Serialize)]
 pub struct HkdfStep5ZeroizeDemo {
     pub k1_before_b64: String,
@@ -390,8 +565,76 @@ pub struct HkdfStep5ZeroizeDemo {
     pub aes_after_b64: String,
 }
 
-/// Demo helper: derive K1 and ss, blend with HKDF, show Base64 before/after zeroize.
-/// For demo only — do not keep in production.
+#[command]
+pub fn debug_hkdf_step5_zeroize_demo(
+    db: State<AppDb>,
+    master_password: String
+) -> Result<HkdfStep5ZeroizeDemo, String> {
+    use hkdf::Hkdf;
+    use sha2::Sha256;
+
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let salt_pw_b64: String = conn.query_row(
+        "SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get(0)
+    ).map_err(|_| "salt_pw missing")?;
+    let salt_kdf_b64: String = conn.query_row(
+        "SELECT value FROM meta WHERE key='salt_kdf'", [], |r| r.get(0)
+    ).map_err(|_| "salt_kdf missing")?;
+
+    let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode")?;
+    let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
+
+    let mut k1 = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
+
+    let ss_raw: Vec<u8> = {
+        oqs::init();
+        let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768)
+            .map_err(|e| format!("kem new: {e}"))?;
+        let (pk, _) = kem.keypair().map_err(|e| format!("keypair: {e}"))?;
+        let (_ct, ss) = kem.encapsulate(&pk).map_err(|e| format!("encaps: {e}"))?;
+        ss.as_ref().to_vec()
+    };
+
+    let mut ikm = Vec::with_capacity(64);
+    ikm.extend_from_slice(&k1);
+    ikm.extend_from_slice(&ss_raw);
+
+    let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
+    let mut aes_key = [0u8; 32];
+    hk.expand(b"vault-key", &mut aes_key).map_err(|_| "HKDF expand")?;
+
+    let k1_before_b64 = B64.encode(&k1);
+    let ss_before_b64 = B64.encode(&ss_raw);
+    let ikm_before_len = ikm.len();
+    let aes_before_b64 = B64.encode(&aes_key);
+
+    k1.zeroize();
+    let mut ss_vec = ss_raw.clone();
+    ss_vec.zeroize();
+    let ikm_after_all_zero = {
+        ikm.zeroize();
+        ikm.iter().all(|&b| b == 0)
+    };
+    aes_key.zeroize();
+
+    let k1_after_b64 = B64.encode(&k1);
+    let ss_after_b64 = B64.encode(&ss_vec);
+    let aes_after_b64 = B64.encode(&aes_key);
+
+    Ok(HkdfStep5ZeroizeDemo {
+        k1_before_b64,
+        k1_after_b64,
+        ss_before_b64,
+        ss_after_b64,
+        ikm_before_len,
+        ikm_after_all_zero,
+        aes_before_b64,
+        aes_after_b64,
+    })
+}
+
+// Print/Assert zeroize demo
 #[derive(serde::Serialize)]
 pub struct ZeroizePrintResult {
     pub k1_len: usize,
@@ -413,15 +656,13 @@ fn count_nonzero(bytes: &[u8]) -> usize {
 }
 
 fn hex4(bytes: &[u8]) -> String {
-    // tiny, redacted preview of the first 4 bytes for visual confirmation
     let take = bytes.iter().take(4);
     let mut s = String::new();
     for b in take { use std::fmt::Write; let _ = write!(s, "{:02x}", b); }
     s
 }
 
-/// Prints before/after status around Step 5 zeroization; asserts (returns Err) if any buffer
-/// is not fully zeroized afterwards. For demo only.
+/// Prints before/after status around Step 5 zeroization; asserts if any buffer is not fully zeroized afterwards.
 #[command]
 pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> Result<ZeroizePrintResult, String> {
     use hkdf::Hkdf;
@@ -429,7 +670,6 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
 
     println!("== debug_step5_zeroize_print ==");
 
-    // load salts from DB
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     let salt_pw_b64: String = conn.query_row(
         "SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get(0)
@@ -441,41 +681,9 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
     let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode")?;
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
 
-    // derive K1 (RAM only)
     let mut k1 = [0u8; 32];
     pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
 
-    // obtain ss
-    // Path A: FFI decapsulation using stored ct+sk (enable with --features ffi-decap)
-    #[cfg(feature = "ffi-decap")]
-    let ss_raw: Vec<u8> = {
-        use oqs_sys as oqsffi;
-        let ct_b64: String = conn.query_row(
-            "SELECT value FROM meta WHERE key='ct_kem'", [], |r| r.get(0)
-        ).map_err(|_| "ct_kem missing")?;
-        let ct_bytes = B64.decode(&ct_b64).map_err(|_| "ct_kem decode")?;
-        let sk_path = keystore_path().map_err(|e| e.to_string())?;
-        let sk_bytes = std::fs::read(&sk_path).map_err(|_| "sk missing")?;
-        unsafe {
-            let kem = oqsffi::kem::OQS_KEM_ml_kem_768_new();
-            if kem.is_null() { return Err("ffi kem new failed".into()); }
-            let mut ss = vec![0u8; 32];
-            let rc = oqsffi::kem::OQS_KEM_decaps(
-                kem,
-                ss.as_mut_ptr(),
-                ct_bytes.as_ptr(),
-                sk_bytes.as_ptr()
-            );
-            oqsffi::kem::OQS_KEM_free(kem);
-            if rc != oqsffi::common::OQS_STATUS_OQS_SUCCESS {
-                return Err("ffi decapsulation failed".into());
-            }
-            ss
-        }
-    };
-
-    // Path B: fallback (no FFI) — make an ephemeral keypair and encapsulate
-    #[cfg(not(feature = "ffi-decap"))]
     let ss_raw: Vec<u8> = {
         oqs::init();
         let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768)
@@ -485,17 +693,14 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
         ss.as_ref().to_vec()
     };
 
-    // IKM = K1 || ss
     let mut ikm = Vec::with_capacity(64);
     ikm.extend_from_slice(&k1);
     ikm.extend_from_slice(&ss_raw);
 
-    // HKDF -> AES-256 key (RAM only)
     let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
     let mut aes_key = [0u8; 32];
     hk.expand(b"vault-key", &mut aes_key).map_err(|_| "HKDF expand failed")?;
 
-    // BEFORE: print non-secret diagnostics (lengths + nonzero counts + tiny preview)
     let k1_nonzero_before  = count_nonzero(&k1);
     let ss_nonzero_before  = count_nonzero(&ss_raw);
     let ikm_nonzero_before = count_nonzero(&ikm);
@@ -505,14 +710,12 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
     println!("[before] IKM: len={} nonzero={}", ikm.len(), ikm_nonzero_before);
     println!("[before] AES: len=32 nonzero={} preview={}..", aes_nonzero_before, hex4(&aes_key));
 
-    // ZEROIZE
     k1.zeroize();
     let mut ss_mut = ss_raw.clone();
     ss_mut.zeroize();
     ikm.zeroize();
     aes_key.zeroize();
 
-    // AFTER: verify zeroization
     let k1_zeroized  = k1.iter().all(|&b| b == 0);
     let ss_zeroized  = ss_mut.iter().all(|&b| b == 0);
     let ikm_zeroized = ikm.iter().all(|&b| b == 0);
@@ -523,7 +726,6 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
     println!("[after]  IKM zeroized={}", ikm_zeroized);
     println!("[after]  AES zeroized={}", aes_zeroized);
 
-    // Hard fail if any didn’t zeroize (handy during demo)
     if !(k1_zeroized && ss_zeroized && ikm_zeroized && aes_zeroized) {
         return Err("zeroize check failed (one or more buffers not cleared)".into());
     }
@@ -542,4 +744,24 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
         ikm_zeroized,
         aes_zeroized,
     })
+}
+
+// Step 6/7 debug helpers
+#[derive(serde::Serialize)]
+pub struct VaultKeyStatus { pub loaded: bool }
+
+#[command]
+pub fn debug_vault_key_status() -> Result<VaultKeyStatus, String> {
+    Ok(VaultKeyStatus { loaded: VAULT_AES_KEY.get().is_some() })
+}
+
+#[derive(serde::Serialize)]
+pub struct DbPathInfo { pub path: String, pub exists: bool, pub size: Option<u64> }
+
+#[command]
+pub fn debug_db_path() -> Result<DbPathInfo, String> {
+    let p = vault_db_path().map_err(|e| e.to_string())?;
+    let exists = p.exists();
+    let size = if exists { fs::metadata(&p).ok().map(|m| m.len()) } else { None };
+    Ok(DbPathInfo { path: p.to_string_lossy().to_string(), exists, size })
 }
