@@ -8,6 +8,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
+use hkdf::Hkdf;
 
 use oqs; // high-level, safe wrappers
 use std::{fs, io, path::{Path, PathBuf}};
@@ -135,12 +136,31 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
     pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, iterations.into(), &mut k1);
     println!("(debug) PBKDF2 derived K1 (32 bytes in RAM)");
 
-    // Device KEM keypair + self-encapsulation
-    let (pk_kem_raw, ct_kem_raw) = generate_device_keypair().map_err(|e| e.to_string())?;
+    // Device KEM keypair + self-encapsulation (returns pk, ct, ss)
+    let (pk_kem_raw, ct_kem_raw, mut ss_buf) = generate_device_keypair()
+        .map_err(|e| e.to_string())?;
     println!(
-        "(debug) pk_kem_bytes_len={}, ct_kem_bytes_len={}",
-        pk_kem_raw.len(), ct_kem_raw.len()
+        "(debug) pk_kem_bytes_len={}, ct_kem_bytes_len={}, ss_len={}",
+        pk_kem_raw.len(), ct_kem_raw.len(), ss_buf.len()
     );
+
+    // Step 5: Blend K1 and ss via HKDF-SHA256:
+    // IKM = K1 || ss, salt = salt_kdf, info = "vault-key", out_len = 32 (AES-256)
+    let mut ikm = Vec::with_capacity(64);
+    ikm.extend_from_slice(&k1);
+    ikm.extend_from_slice(&ss_buf);
+
+    let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
+    let mut aes_key = [0u8; 32];
+    hk.expand(b"vault-key", &mut aes_key)
+        .map_err(|_| "HKDF expand failed")?;
+    println!("(debug) derived AES-256 key (32 bytes) in RAM");
+
+    // Zeroize sensitive inputs immediately
+    k1.zeroize();
+    ss_buf.zeroize();
+    ikm.zeroize();
+    aes_key.zeroize();
 
     // Base64 for TEXT meta
     let pk_kem_b64 = B64.encode(&pk_kem_raw);
@@ -162,17 +182,15 @@ pub fn create_vault(db: State<AppDb>, master_password: String) -> Result<bool, S
         tx.commit().map_err(|e| e.to_string())?;
     }
 
-    // Zeroize K1 (good hygiene; you’ll HKDF it later)
-    k1.zeroize();
-
+    // K1/ss/AES key never persisted; only public data saved.
     println!("(debug) salts + kdf + kem public material stored; SK on disk.");
     println!("== create_vault done ==");
     Ok(true)
 }
 
 /// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,
-/// writes SK to keystore with tight perms, and returns (pk_raw, ct_raw).
-fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
+/// writes SK to keystore with tight perms, and returns (pk_raw, ct_raw, ss).
+fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     oqs::init();
 
     let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768)
@@ -200,8 +218,12 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
         .map_err(|e| format!("write sk: {e}"))?;
     println!("(debug) wrote secret key to: {}", sk_path.to_string_lossy());
 
-    // Return raw pk/ct bytes for DB storage (as Base64)
-    Ok((pk_kem.as_ref().to_vec(), ct_kem.as_ref().to_vec()))
+    // Return raw pk/ct bytes + ss (RAM-only; caller will zeroize ss)
+    Ok((
+        pk_kem.as_ref().to_vec(),
+        ct_kem.as_ref().to_vec(),
+        ss_raw.as_ref().to_vec(),
+    ))
 }
 
 // ============================ Debug / Demo Helpers ============================
