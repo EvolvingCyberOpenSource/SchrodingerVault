@@ -49,5 +49,5 @@ document.querySelector("#passwordForm").addEventListener("submit", async (e) => 
 
     console.log("password entered: ", password)
     await invoke("create_vault", { masterPassword: password });
-
+    window.location.replace('index.html');
 });

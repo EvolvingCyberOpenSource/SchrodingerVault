@@ -192,8 +192,8 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // check if a user even exists
   // if not, redirect to create password/vault page
-  const exists = await userExists();
-  if (!exists){
-    window.location.replace("create.html");
-  } 
+  // const exists = await userExists();
+  // if (!exists){
+  //   window.location.replace("create.html");
+  // } 
 });
