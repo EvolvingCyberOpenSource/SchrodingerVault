@@ -21,6 +21,7 @@ use std::io::Write;
 use std::sync::OnceLock; // hold AES_KEY in RAM for the session
 use zeroize::Zeroize;
 use dirs;
+use secrecy::{SecretString, ExposeSecret};
 
 // AES-256 vault key lives only in RAM for this process lifetime.
 // We never serialize this; app restart -> key is gone until user logs in again.
@@ -206,7 +207,7 @@ pub fn init_vault_storage(app: AppHandle, db: State<AppDb>) -> Result<String, St
     let conn = rusqlite::Connection::open(&p).map_err(|e| e.to_string())?;
 
     conn.pragma_update(None, "journal_mode", &"WAL").map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "synchronous", &"NORMAL").map_err(|e| e.to_string())?;
+    conn.pragma_update(None, "synchronous", &"FULL").map_err(|e| e.to_string())?;
 
     conn.execute_batch(
         r#"
@@ -243,8 +244,9 @@ pub fn init_vault_storage(app: AppHandle, db: State<AppDb>) -> Result<String, St
 
 #[command]
 pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
+    let master_password = SecretString::from(master_password);
     println!("== create_vault ==");
-    println!("(debug) received password len = {}", master_password.len());
+    println!("(debug) received password len = {}", master_password.expose_secret().len());
 
     // ensure db file exists (recreate after hard reset)
     ensure_db_on_disk(&app, &db)?;
@@ -257,7 +259,7 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
 
     // salts (random)
     let mut r = rng();
-    let mut salt_pw  = [0u8; 16];
+    let mut salt_pw  = [0u8; 32];
     let mut salt_kdf = [0u8; 32];
     r.fill_bytes(&mut salt_pw);
     r.fill_bytes(&mut salt_kdf);
@@ -273,7 +275,7 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
     // PBKDF2 derive K1 (RAM only)
     let iterations: u32 = 310_000;
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, iterations.into(), &mut k1);
+    pbkdf2_hmac::<Sha256>(master_password.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
     println!("(debug) PBKDF2 derived K1 (32 bytes in RAM)");
 
     // Device KEM keypair + self-encapsulation (returns pk, ct, ss)
@@ -285,15 +287,17 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
     );
 
     // Step 5: Blend K1 and ss via HKDF-SHA256:
-    // IKM = K1 || ss, salt = salt_kdf, info = "vault-key", out_len = 32 (AES-256)
-    let mut ikm = Vec::with_capacity(64);
-    ikm.extend_from_slice(&k1);
-    ikm.extend_from_slice(&ss_buf);
+    // HKDF-Extract with K1
+    let hk_k1 = Hkdf::<Sha256>::new(Some(&salt_kdf), &k1);
+    let mut prk1 = [0u8; 32];
+    hk_k1.expand(&[], &mut prk1).map_err(|e| e.to_string())?;
 
-    let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
+    // HKDF-Extract again with ss, using prk1 as salt
+    let hk_final = Hkdf::<Sha256>::new(Some(&prk1), &ss_buf);
+
+    // Expand to AES key
     let mut aes_key_tmp = [0u8; 32];
-    hk.expand(b"vault-key", &mut aes_key_tmp)
-        .map_err(|_| "HKDF expand failed")?;
+    hk_final.expand(b"vault-key", &mut aes_key_tmp).map_err(|_| "HKDF expand failed")?;
     println!("(debug) derived AES-256 key (32 bytes) in RAM");
 
     // Install AES key into process RAM for this session.
@@ -303,7 +307,7 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
     // Zeroize sensitive inputs immediately (K1, ss, IKM only; AES stays in RAM)
     k1.zeroize();
     ss_buf.zeroize();
-    ikm.zeroize();
+    prk1.zeroize();
 
     // Base64 for TEXT meta
     let pk_kem_b64 = B64.encode(&pk_kem_raw);
