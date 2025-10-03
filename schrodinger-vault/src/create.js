@@ -1,14 +1,12 @@
 const { invoke } = window.__TAURI__.core;
 const createMessage = document.querySelector("#create-msg");
 
-
 /**
  * Validates the password and confirm password fields.
  *
  * @returns {boolean} true if pasword meets requirements, false otherwise
  */
 function validatePassword(password, confirmPassword) {
-
   if (password !== confirmPassword) {
     createMessage.textContent = "Passwords do not match!";
     return false;
@@ -20,9 +18,7 @@ function validatePassword(password, confirmPassword) {
   }
 
   // can add more validation here if needed
-
   return true;
-
 }
 
 /**
@@ -33,21 +29,23 @@ function validatePassword(password, confirmPassword) {
  * @returns {void}
  */
 document.querySelector("#passwordForm").addEventListener("submit", async (e) => {
-    e.preventDefault();
+  e.preventDefault();
 
-    const password = document.querySelector("#masterPassword").value;
-    const confirmPassword = document.querySelector("#confirmPassword").value;
+  const password = document.querySelector("#masterPassword").value;
+  const confirmPassword = document.querySelector("#confirmPassword").value;
 
-    // validate password
-    // const validated = validatePassword(password, confirmPassword);
-    // if (!validated) {
-    //   return;
-    // }
+  // validate password (optional right now)
+  // const validated = validatePassword(password, confirmPassword);
+  // if (!validated) return;
 
-    //TODO: hash password with salt and store in database
-    // We still have t
+  console.log("password entered: ", password);
 
-    console.log("password entered: ", password)
-    await invoke("create_vault", { masterPassword: password });
-    window.location.replace('index.html');
+  try {
+    // IMPORTANT: arg name must be snake_case to match Rust signature
+    await invoke("create_vault", { master_password: password });
+    window.location.replace("index.html");
+  } catch (e) {
+    console.error(e);
+    createMessage.textContent = "Failed to create vault. See console for details.";
+  }
 });

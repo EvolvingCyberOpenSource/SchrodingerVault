@@ -1,12 +1,9 @@
-use tauri::{command, State};
+use tauri::{command, AppHandle, State};
 use rusqlite::{params, OptionalExtension};
 use crate::state::AppDb;
-use crate::vault_core::db::db_path;
-use tauri::AppHandle;
-use std::mem;
 use crate::vault_core::db::{self, EntryListItem, NewEntry};
 
-use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes
+use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes (reserved for future nonce use)
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
@@ -23,13 +20,19 @@ use zeroize::Zeroize;
 use dirs;
 use secrecy::{SecretString, ExposeSecret};
 
-// AES-256 vault key lives only in RAM for this process lifetime.
-// We never serialize this; app restart -> key is gone until user logs in again.
+// =========================
+// Session AES key (RAM-only)
+// =========================
+
 static VAULT_AES_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+// =========================
+// Keystore helpers (KEM SK)
+// =========================
 
 /// Write a secret key file with tight permissions:
 /// - Unix/macOS: 0600
-/// - Windows: in %LOCALAPPDATA% (per-user ACLs)
+/// - Windows: per-user ACL in %LOCALAPPDATA%
 fn write_secret_key_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -42,7 +45,6 @@ fn write_secret_key_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .mode(0o600)
             .open(path)?;
         f.write_all(bytes)?;
-        // ensure final perms are exactly 0600
         let mut p = f.metadata()?.permissions();
         p.set_mode(0o600);
         fs::set_permissions(path, p)?;
@@ -51,7 +53,6 @@ fn write_secret_key_secure(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
     #[cfg(windows)]
     {
-        // In %LOCALAPPDATA%, new files inherit a per-user ACL (private to the account).
         let mut f = OpenOptions::new()
             .create(true)
             .write(true)
@@ -73,83 +74,9 @@ fn keystore_path() -> io::Result<PathBuf> {
     Ok(dir.join("mlkem768.sk"))
 }
 
-/// %APPDATA%/SchrodingerVault/vault.sqlite (Windows, roaming)
-/// ~/Library/Application Support/SchrodingerVault/vault.sqlite (macOS)
-/// ~/.local/share/SchrodingerVault/vault.sqlite (Linux)
-fn vault_db_path() -> io::Result<PathBuf> {
-    let base = dirs::data_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no roaming data dir"))?;
-    let dir = base.join("SchrodingerVault");
-    fs::create_dir_all(&dir)?;
-    Ok(dir.join("vault.sqlite"))
-}
-
-/// Create the DB file if missing and set private perms.
-/// On Unix: 0600. On Windows: rely on per-user ACL in %APPDATA%.
-fn ensure_vault_db_file() -> io::Result<PathBuf> {
-    let p = vault_db_path()?;
-
-    if !p.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            let _f = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .mode(0o600)
-                .open(&p)?;
-            let mut perm = fs::metadata(&p)?.permissions();
-            perm.set_mode(0o600);
-            fs::set_permissions(&p, perm)?;
-        }
-        #[cfg(windows)]
-        {
-            // Creating in %APPDATA% gives a per-user ACL by default.
-            let _f = OpenOptions::new().create(true).write(true).open(&p)?;
-        }
-    }
-
-    Ok(p)
-}
-
-/// Ensure the on-disk DB exists and schema is present; used after a hard reset.
-/// Uses the app-scoped db_path for exact location and applies schema to the live connection.
-fn ensure_db_on_disk(app: &AppHandle, db: &State<AppDb>) -> Result<(), String> {
-    let p = db_path(app);
-    if !p.exists() {
-        if let Some(parent) = p.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("create db dir: {e}"))?;
-        }
-        OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&p)
-            .map_err(|e| format!("touch db: {e}"))?;
-
-        let schema = r#"
-            PRAGMA journal_mode = WAL;
-            CREATE TABLE IF NOT EXISTS meta (
-              key   TEXT PRIMARY KEY,
-              value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS entries (
-              id          INTEGER PRIMARY KEY AUTOINCREMENT,
-              label       TEXT NOT NULL,
-              username    TEXT,
-              nonce       BLOB NOT NULL,        -- 12 bytes (AES-GCM)
-              ciphertext  BLOB NOT NULL,        -- sealed data
-              created_at  INTEGER NOT NULL,     -- unix epoch (seconds)
-              updated_at  INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_entries_label ON entries(label);
-        "#;
-        let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-        conn.execute_batch(schema).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-//Examples / Demo
+// =========================
+// Demo / examples
+// =========================
 
 #[command]
 pub fn greet(name: &str) -> String {
@@ -158,46 +85,6 @@ pub fn greet(name: &str) -> String {
 
 #[derive(serde::Serialize)]
 pub struct Person { pub id: i32, pub name: String }
-
-//Input validation
-
-fn validate_label(label: &str) -> Result<String, String> {
-    let trimmed_label = label.trim();
-    if trimmed_label.is_empty() { return Err("Label is required".into()); }
-    if trimmed_label.len() > 128 { return Err("Label is too long (max 128)".into()); }
-    Ok(trimmed_label.to_string())
-}
-
-fn validate_username(username: &str) -> Result<String, String> {
-    let trimmed_username = username.trim();
-    if trimmed_username.is_empty() { return Err("Username is required".into()); }
-    if trimmed_username.len() > 256 { return Err("Username is too long (max 256)".into()); }
-    Ok(trimmed_username.to_string())
-}
-
-fn validate_password(password: &str) -> Result<String, String> {
-    if password.is_empty() { return Err("Password is required".into()); }
-    if password.len() > 10000 { return Err("Password is too long".into()); }
-    Ok(password.to_string())
-}
-
-fn validate_notes(opt: &Option<String>) -> Result<Option<String>, String> {
-    if let Some(notes) = opt {
-        let trimmed_notes = notes.trim();
-        if trimmed_notes.len() > 2_000 {
-            return Err("Notes are too long (max 2000)".into());
-        }
-        if trimmed_notes.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed_notes.to_string()))
-        }
-    } else {
-        Ok(None)
-    }
-}
-
-//People demo (unchanged)
 
 #[command]
 pub fn add_person(db: State<AppDb>, name: String) -> Result<(), String> {
@@ -230,69 +117,18 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
     Ok(out)
 }
 
-// Vault Storage Init (Step 6/7)
-
-/// Create the vault DB file with private perms and ensure tables exist.
-#[command]
-pub fn init_vault_storage(app: AppHandle, db: State<AppDb>) -> Result<String, String> {
-    // === FIX: Use the same tauri-scoped DB path everywhere and bind live connection to it ===
-    let p = db_path(&app);
-    if let Some(parent) = p.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create db dir: {e}"))?;
-    }
-
-    // Open a temporary connection for migrations.
-    let conn = rusqlite::Connection::open(&p).map_err(|e| e.to_string())?;
-
-    conn.pragma_update(None, "journal_mode", &"WAL").map_err(|e| e.to_string())?;
-    conn.pragma_update(None, "synchronous", &"FULL").map_err(|e| e.to_string())?;
-
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS entries (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            label       TEXT NOT NULL,
-            username    TEXT,
-            nonce       BLOB NOT NULL,         -- 12 bytes (AES-GCM)
-            ciphertext  BLOB NOT NULL,         -- sealed data
-            created_at  INTEGER NOT NULL,      -- unix epoch (seconds)
-            updated_at  INTEGER NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_entries_label ON entries(label);
-        "#
-    ).map_err(|e| e.to_string())?;
-
-    //  FIX: swap the live AppDb connection to this on-disk file 
-    {
-        let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-        let _old = std::mem::replace(&mut *guard, conn);
-        // _old drops here
-    }
-
-    Ok(format!("vault DB ready at {}", p.to_string_lossy()))
-}
-
-//Vault Init (Step 5 blended into Step 6/7)
+// =========================
+// Vault creation (Step 5–7)
+// DB schema is created by vault_core::db::open_and_init in main.rs setup
+// =========================
 
 #[command]
-pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
+pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
     let master_password = SecretString::from(master_password);
     println!("== create_vault ==");
     println!("(debug) received password len = {}", master_password.expose_secret().len());
 
-    // ensure db file exists (recreate after hard reset)
-    ensure_db_on_disk(&app, &db)?;
-
-    // Ensure DB file and tables exist before we write meta.
-    // FIX: also ensures the live connection is bound to the file
-    let _ = init_vault_storage(app.clone(), db.clone())?;
-
+    // Use the live, already-initialized connection
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
 
     // salts (random)
@@ -371,7 +207,6 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
         tx.commit().map_err(|e| e.to_string())?;
     }
 
-    // K1/ss/AES key never persisted; only public data saved.
     println!("(debug) salts + kdf + kem public material stored; SK on disk.");
     println!("== create_vault done ==");
     Ok(true)
@@ -407,7 +242,6 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
         .map_err(|e| format!("write sk: {e}"))?;
     println!("(debug) wrote secret key to: {}", sk_path.to_string_lossy());
 
-    // Return raw pk/ct bytes + ss (RAM-only; caller will zeroize/retain as needed)
     Ok((
         pk_kem.as_ref().to_vec(),
         ct_kem.as_ref().to_vec(),
@@ -415,7 +249,9 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     ))
 }
 
-//Debug / Demo Helpers
+// =========================
+// Debug helpers
+// =========================
 
 #[derive(serde::Serialize)]
 pub struct KemStatus {
@@ -513,7 +349,6 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
     let sk_path = keystore_path().map_err(|e| e.to_string())?;
     remove_file_if_exists(&sk_path).map_err(|e| format!("remove sk: {e}"))?;
 
-    // make this mutable ↓↓↓
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
@@ -528,11 +363,10 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
     Ok(true)
 }
 
-/// Do soft reset AND wipe entries table (if present).
-/// Optionally delete the DB file itself for a full reset.
+/// Hard reset: soft reset + wipe entries + recreate DB schema via open_and_init.
 #[command]
 pub fn debug_reset_vault_hard(app: AppHandle, db: State<AppDb>) -> Result<bool, String> {
-    // 1) do the soft reset (clears meta + deletes keystore)
+    // 1) soft reset
     debug_reset_vault_soft(db.clone())?;
 
     // 2) wipe entries table
@@ -543,15 +377,15 @@ pub fn debug_reset_vault_hard(app: AppHandle, db: State<AppDb>) -> Result<bool, 
         tx.commit().map_err(|e| e.to_string())?;
     }
 
-    // 3) swap live connection to in-memory to release file locks, then delete file
+    // 3) release file locks
     {
         let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
         let tmp = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
-        let _old = mem::replace(&mut *guard, tmp);
-        // _old drops here, releasing any file handles
+        let _old = std::mem::replace(&mut *guard, tmp);
     }
 
-    let p = db_path(&app);
+    // 4) delete db file and recreate via open_and_init
+    let p = crate::vault_core::db::db_path(&app);
     if p.exists() {
         if let Err(e) = std::fs::remove_file(&p) {
             eprintln!("(reset) failed to remove DB file {}: {}", p.display(), e);
@@ -562,10 +396,13 @@ pub fn debug_reset_vault_hard(app: AppHandle, db: State<AppDb>) -> Result<bool, 
         println!("(reset) db file already missing");
     }
 
-    // FIX: Recreate DB file + schema and rebind live connection to it
-    let _ = init_vault_storage(app.clone(), db.clone())?;
+    let new_conn = crate::vault_core::db::open_and_init(&app).map_err(|e| e.to_string())?;
+    {
+        let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let _old = std::mem::replace(&mut *guard, new_conn);
+    }
 
-    println!("(reset) hard reset done (entries wiped, keystore removed, meta cleared, db file removed)");
+    println!("(reset) hard reset done (entries wiped, keystore removed, meta cleared, db recreated)");
     Ok(true)
 }
 
@@ -702,7 +539,6 @@ fn hex4(bytes: &[u8]) -> String {
     s
 }
 
-/// Prints before/after status around Step 5 zeroization; asserts if any buffer is not fully zeroized afterwards.
 #[command]
 pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> Result<ZeroizePrintResult, String> {
     use hkdf::Hkdf;
@@ -799,14 +635,52 @@ pub fn debug_vault_key_status() -> Result<VaultKeyStatus, String> {
 pub struct DbPathInfo { pub path: String, pub exists: bool, pub size: Option<u64> }
 
 #[command]
-pub fn debug_db_path() -> Result<DbPathInfo, String> {
-    let p = vault_db_path().map_err(|e| e.to_string())?;
+pub fn debug_db_path(app: AppHandle) -> Result<DbPathInfo, String> {
+    let p = crate::vault_core::db::db_path(&app);
     let exists = p.exists();
     let size = if exists { fs::metadata(&p).ok().map(|m| m.len()) } else { None };
     Ok(DbPathInfo { path: p.to_string_lossy().to_string(), exists, size })
 }
 
-//Vault CRUD (merged from second file) 
+// =========================
+// Vault CRUD (placeholder crypto for now)
+// =========================
+
+fn validate_label(label: &str) -> Result<String, String> {
+    let trimmed_label = label.trim();
+    if trimmed_label.is_empty() { return Err("Label is required".into()); }
+    if trimmed_label.len() > 128 { return Err("Label is too long (max 128)".into()); }
+    Ok(trimmed_label.to_string())
+}
+
+fn validate_username(username: &str) -> Result<String, String> {
+    let trimmed_username = username.trim();
+    if trimmed_username.is_empty() { return Err("Username is required".into()); }
+    if trimmed_username.len() > 256 { return Err("Username is too long (max 256)".into()); }
+    Ok(trimmed_username.to_string())
+}
+
+fn validate_password(password: &str) -> Result<String, String> {
+    if password.is_empty() { return Err("Password is required".into()); }
+    if password.len() > 10000 { return Err("Password is too long".into()); }
+    Ok(password.to_string())
+}
+
+fn validate_notes(opt: &Option<String>) -> Result<Option<String>, String> {
+    if let Some(notes) = opt {
+        let trimmed_notes = notes.trim();
+        if trimmed_notes.len() > 2_000 {
+            return Err("Notes are too long (max 2000)".into());
+        }
+        if trimmed_notes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed_notes.to_string()))
+        }
+    } else {
+        Ok(None)
+    }
+}
 
 #[command]
 pub fn vault_list(db: State<AppDb>) -> Result<Vec<EntryListItem>, String> {
@@ -827,9 +701,8 @@ pub fn vault_add(
     let password = validate_password(&password)?;
     let notes = validate_notes(&notes)?;
 
-    // TODO: Replace with real AES-256-GCM using VAULT_AES_KEY and 12-byte random nonce.
+    // TODO: Replace with real AES-256-GCM using VAULT_AES_KEY and a 12-byte random nonce.
     // TEMP placeholder: nonce all-zero, ciphertext = plaintext password bytes
-    let _r = rng(); // keeping rng imported; use for real nonce later
     let nonce = [0u8; 12];
     let ciphertext_bytes = password.into_bytes();
 

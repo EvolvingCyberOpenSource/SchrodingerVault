@@ -10,7 +10,7 @@ pub fn db_path(app: &tauri::AppHandle) -> PathBuf {
 }
 
 /// Return structs for query functions
-// TODO: move into seperate file in utils folder (wasn't sure if this was being worked on)
+// TODO: move into separate file in utils folder
 #[derive(serde::Serialize)]
 pub struct EntryListItem {
     pub id: i64,
@@ -29,7 +29,7 @@ pub struct NewEntry<'a> {
     pub ciphertext: &'a [u8], // stores plain text for now
 }
 
-/// open the database and create schema if needed returing a connection object
+/// open the database and create schema if needed returning a connection object
 pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
     let path = db_path(app);
 
@@ -42,7 +42,20 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
 
     let conn = Connection::open(path)?;
 
-    // test table 
+    // Good defaults for desktop apps (requires rusqlite >= 0.29)
+    let _ = conn.pragma_update(None, "journal_mode", &"WAL");
+    let _ = conn.pragma_update(None, "synchronous", &"FULL");
+
+    // Needed by create_vault()
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    // test table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS person (
            id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,14 +65,13 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
         [],
     )?;
 
-    // table for the user (only 1 user allowed)
-    // this table is the WRONG schema, will be deleted
+    // table for the user (legacy demo; to be deleted later)
     conn.execute(
         "CREATE TABLE IF NOT EXISTS user (
             id              INTEGER PRIMARY KEY CHECK (id = 1),
             password_hash   TEXT    NOT NULL,
             salt            BLOB    NOT NULL
-            )",
+        )",
         [],
     )?;
 
@@ -69,12 +81,18 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             label       TEXT NOT NULL UNIQUE,
             username    TEXT NOT NULL,
-            notes       TEXT,              
+            notes       TEXT,
             nonce       BLOB NOT NULL,
             ciphertext  BLOB NOT NULL,
             created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            )",
+        )",
+        [],
+    )?;
+
+    // Helpful index for listing/search
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_entries_label ON entries(label)",
         [],
     )?;
 
@@ -83,23 +101,19 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
 
 /// Query functions for entries table
 pub fn list_entries(conn: &Connection) -> Result<Vec<EntryListItem>> {
-    // Make query statment
     let mut stmt = conn.prepare(
         r#"
         SELECT id, label, username, notes, created_at, updated_at
         FROM entries
         ORDER BY label COLLATE NOCASE
         "#,
-    )?; 
-    // rows is an iterator, each item is Result<EntryListItem>
+    )?;
     let rows = stmt.query_map([], |row| row_to_list_item(row))?;
 
-    // create vector containing all rows from query
     let mut out = Vec::new();
     for r in rows {
         out.push(r?);
     }
-    // return vecotor of entries
     Ok(out)
 }
 
@@ -124,7 +138,7 @@ pub fn add_entry(conn: &Connection, e: NewEntry) -> Result<EntryListItem> {
         params![e.label, e.username, e.notes, e.nonce, e.ciphertext],
     )?;
 
-    // Prepare to return added entry so it can be displayed in UI immediatly
+    // Prepare to return added entry so it can be displayed in UI immediately
     let id = conn.last_insert_rowid();
     let mut stmt = conn.prepare(
         r#"
@@ -139,7 +153,7 @@ pub fn add_entry(conn: &Connection, e: NewEntry) -> Result<EntryListItem> {
 }
 
 pub fn delete_entry(conn: &Connection, id: i64) -> Result<usize> {
-    conn.execute("DELETE FROM entries WHERE id = ?1", params![id]) 
+    conn.execute("DELETE FROM entries WHERE id = ?1", params![id])
 }
 
 // TEMP: for now this just passes plain ciphertext as a string to demo show password function

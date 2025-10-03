@@ -1,10 +1,8 @@
 // bridges to call Rust commands from JavaScript
 const { invoke } = window.__TAURI__.core;
 
-
 // ********
-// this block of code can be deleted, its just boilerplate to test calling rust commands
-// but its a good example of how a call to rust works
+// demo greet boilerplate (can be removed)
 let greetInputEl;
 let greetMsgEl;
 greetInputEl = document.querySelector("#greet-input");
@@ -18,11 +16,10 @@ async function greet() {
 }
 // ********
 
+const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
 
-const PASS_VIS_DURATION = 10000   // Time till password is hidden (10s)
 // --- Password reveal ---
 async function showPassword(id, secretSpan, showBtn) {
-  // TODO: find best way to clear revealed password variable from memory
   try {
     showBtn.disabled = true;
     const value = await invoke("vault_get", { id });
@@ -40,18 +37,16 @@ async function showPassword(id, secretSpan, showBtn) {
 
 // --- Copy password ---
 async function copyPassword(id) {
-  // This should write to and clear the clipboard but may not work depending on sys settings
   try {
     const value = await invoke("vault_get", { id });
     await navigator.clipboard.writeText(value);
     setTimeout(async () => {
       try {
-        // Only clear if user hasn't changed clipboard
         const current_clipboard = await navigator.clipboard.readText();
         if (current_clipboard === value) {
           await navigator.clipboard.writeText("");
         }
-      } catch {
+      } catch (err) {
         console.log("Clipboard read error: ", err);
       }
     }, PASS_VIS_DURATION);
@@ -62,7 +57,6 @@ async function copyPassword(id) {
 
 // --- Delete an entry ---
 async function deleteEntry(id, row, label) {
-  // Ask user to confirm delete
   const ok = confirm(`Delete "${label}"?`);
   if (!ok) return;
   try {
@@ -79,7 +73,6 @@ function renderRow(e) {
   row.className = "entry-row";
   row.textContent = `${e.label} — ${e.username}${e.notes ? " — " + e.notes : ""}`;
 
-  // show button
   const secretSpan = document.createElement("span");
   secretSpan.className = "secret";
   row.appendChild(secretSpan);
@@ -90,14 +83,12 @@ function renderRow(e) {
   showBtn.addEventListener("click", () => showPassword(e.id, secretSpan, showBtn));
   row.appendChild(showBtn);
 
-  // Copy button
   const copyBtn = document.createElement("button");
   copyBtn.type = "button";
   copyBtn.textContent = "Copy password";
   copyBtn.addEventListener("click", () => copyPassword(e.id));
   row.appendChild(copyBtn);
 
-  // Delete button
   const delBtn = document.createElement("button");
   delBtn.type = "button";
   delBtn.textContent = "Delete";
@@ -141,7 +132,7 @@ document.querySelector("#add-entry").addEventListener("submit", (e) => {
   addEntry();
 });
 
-async function addEntry(params) {
+async function addEntry() {
   const label = labelEl.value;
   const username = usernameEl.value;
   const password = passwordEl.value;
@@ -149,7 +140,7 @@ async function addEntry(params) {
   const notes = notesRaw.trim().length ? notesRaw : null;
 
   try {
-    await invoke("vault_add", { label, username, password, notes});
+    await invoke("vault_add", { label, username, password, notes });
     // clear inputs after add
     labelEl.value = "";
     usernameEl.value = "";
@@ -159,41 +150,32 @@ async function addEntry(params) {
     // reload list with new entry
     await loadEntries();
   } catch (err) {
-    console.log("Error adding entry: ", err)
+    console.log("Error adding entry: ", err);
   }
-  
 }
-
 
 /**
  * Calls Rust function `user_exists` to query the database if a user exists.
  *
  * @returns {boolean} true if user exists, false otherwise
  */
-async function userExists(){
-
+async function userExists() {
   console.log("Checking if user exists...");
   try {
-
-    const userExists = await invoke("user_exists"); // invoke rust command
-    console.log("User exists:", userExists);
-    return userExists;
-
+    const exists = await invoke("user_exists");
+    console.log("User exists:", exists);
+    return exists;
   } catch (err) {
-
     console.log("Error checking user existence:", err);
     return false;
-  
   }
 }
 
-// this is immediately called when the web page is loaded
+// Load entries when the page is ready
 window.addEventListener("DOMContentLoaded", async () => {
-
-  // check if a user even exists
-  // if not, redirect to create password/vault page
+  // Optional gate if you want to redirect to create.html:
   // const exists = await userExists();
-  // if (!exists){
-  //   window.location.replace("create.html");
-  // } 
+  // if (!exists) return window.location.replace("create.html");
+
+  await loadEntries();
 });
