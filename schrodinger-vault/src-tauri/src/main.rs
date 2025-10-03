@@ -41,6 +41,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_step5_zeroize_print,
             commands::debug_db_path,
             commands::debug_vault_key_status,
+            commands::debug_list_schema,
         ])
 }
 

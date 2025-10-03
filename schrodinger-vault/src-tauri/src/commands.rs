@@ -641,6 +641,78 @@ pub fn debug_db_path(app: AppHandle) -> Result<DbPathInfo, String> {
     let size = if exists { fs::metadata(&p).ok().map(|m| m.len()) } else { None };
     Ok(DbPathInfo { path: p.to_string_lossy().to_string(), exists, size })
 }
+// command to list tables & schemas
+#[derive(serde::Serialize)]
+pub struct ColumnInfo {
+    pub cid: i64,
+    pub name: String,
+    pub r#type: Option<String>,
+    pub notnull: bool,
+    pub dflt_value: Option<String>,
+    pub pk: bool,
+}
+
+#[derive(serde::Serialize)]
+pub struct TableSchema {
+    pub name: String,
+    pub sql: Option<String>,         // CREATE TABLE ... (may be None for internal tables)
+    pub columns: Vec<ColumnInfo>,
+}
+
+#[tauri::command]
+pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+
+    // 1) get all tables (user + internal), ordered by name
+    let mut stmt = conn
+        .prepare("SELECT name, sql FROM sqlite_master WHERE type='table' ORDER BY name")
+        .map_err(|e| e.to_string())?;
+    let tables = stmt
+        .query_map([], |row| {
+            let name: String = row.get(0)?;
+            let sql: Option<String> = row.get(1)?;
+            Ok((name, sql))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut out: Vec<TableSchema> = Vec::new();
+
+    for t in tables {
+        let (name, sql) = t.map_err(|e| e.to_string())?;
+
+        // 2) columns for each table via PRAGMA table_info(table_name)
+        let pragma = format!("PRAGMA table_info({})", name);
+        let mut col_stmt = conn.prepare(&pragma).map_err(|e| e.to_string())?;
+        let cols_iter = col_stmt
+            .query_map([], |row| {
+                // cid, name, type, notnull, dflt_value, pk
+                let cid: i64 = row.get(0)?;
+                let cname: String = row.get(1)?;
+                let ctype: Option<String> = row.get(2)?;
+                let notnull_i: i64 = row.get(3)?;
+                let dflt_value: Option<String> = row.get(4)?;
+                let pk_i: i64 = row.get(5)?;
+                Ok(ColumnInfo {
+                    cid,
+                    name: cname,
+                    r#type: ctype,
+                    notnull: notnull_i != 0,
+                    dflt_value,
+                    pk: pk_i != 0,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        let mut columns = Vec::new();
+        for c in cols_iter {
+            columns.push(c.map_err(|e| e.to_string())?);
+        }
+
+        out.push(TableSchema { name, sql, columns });
+    }
+
+    Ok(out)
+}
 
 // =========================
 // Vault CRUD (placeholder crypto for now)

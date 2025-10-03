@@ -49,6 +49,22 @@ verify AES key is loaded in RAM
 
 await window.__TAURI__.core.invoke('debug_vault_key_status')
 
+command to list tables & schemas:
+
+await window.__TAURI__.core.invoke("debug_list_schema")
+
+optional: can also do it this way to group by table name, with a column table.
+
+// Ask Rust for all table schemas
+const schemas = await window.__TAURI__.core.invoke("debug_list_schema");
+
+schemas.forEach(t => {
+  console.group(`TABLE: ${t.name}`);
+  console.log("SQL:", t.sql);
+  console.table(t.columns);
+  console.groupEnd();
+});
+
 
 
 
