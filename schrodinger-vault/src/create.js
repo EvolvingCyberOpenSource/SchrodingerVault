@@ -32,7 +32,7 @@ document.querySelector("#passwordForm").addEventListener("submit", async (e) => 
   e.preventDefault();
 
   const password = document.querySelector("#masterPassword").value;
-  const confirmPassword = document.querySelector("#confirmPassword").value;
+  const confirm_Password = document.querySelector("#confirmPassword").value;
 
   // validate password (optional right now)
   // const validated = validatePassword(password, confirmPassword);
@@ -42,7 +42,7 @@ document.querySelector("#passwordForm").addEventListener("submit", async (e) => 
 
   try {
     // IMPORTANT: arg name must be snake_case to match Rust signature
-    await invoke("create_vault", { master_password: password });
+    await invoke("create_vault", { masterPassword: password });
     window.location.replace("index.html");
   } catch (e) {
     console.error(e);

@@ -154,28 +154,22 @@ async function addEntry() {
   }
 }
 
-/**
- * Calls Rust function `user_exists` to query the database if a user exists.
- *
- * @returns {boolean} true if user exists, false otherwise
- */
-async function userExists() {
-  console.log("Checking if user exists...");
-  try {
-    const exists = await invoke("user_exists");
-    console.log("User exists:", exists);
-    return exists;
-  } catch (err) {
-    console.log("Error checking user existence:", err);
-    return false;
-  }
-}
-
-// Load entries when the page is ready
+// --- send to create.html if vault not initialized ---
 window.addEventListener("DOMContentLoaded", async () => {
-  // Optional gate if you want to redirect to create.html:
-  // const exists = await userExists();
-  // if (!exists) return window.location.replace("create.html");
+  try {
+    // Use existing debug_kem_status to detect first run:
+    // initialized if we have SK file OR KEM pub/ct saved.
+    const s = await invoke("debug_kem_status"); // { sk_exists, pk_kem_bytes_len, ct_kem_bytes_len, ... }
+    const initialized = s && (s.sk_exists || s.pk_kem_bytes_len > 0 || s.ct_kem_bytes_len > 0);
 
-  await loadEntries();
+    if (!initialized) {
+      return window.location.replace("create.html");
+    }
+
+    await loadEntries();
+  } catch (err) {
+    console.error("Init check failed:", err);
+    // Safe fallback: assume first run
+    window.location.replace("create.html");
+  }
 });

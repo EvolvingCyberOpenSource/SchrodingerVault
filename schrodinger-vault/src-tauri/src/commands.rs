@@ -123,10 +123,10 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
 // =========================
 
 #[command]
-pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
-    let master_password = SecretString::from(master_password);
+pub fn create_vault(_app: AppHandle, db: State<AppDb>, masterPassword: String) -> Result<bool, String> {
+    let masterPassword = SecretString::from(masterPassword);
     println!("== create_vault ==");
-    println!("(debug) received password len = {}", master_password.expose_secret().len());
+    println!("(debug) received password len = {}", masterPassword.expose_secret().len());
 
     // Use the live, already-initialized connection
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -149,7 +149,7 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
     // PBKDF2 derive K1 (RAM only)
     let iterations: u32 = 310_000;
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(master_password.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
+    pbkdf2_hmac::<Sha256>(masterPassword.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
     println!("(debug) PBKDF2 derived K1 (32 bytes in RAM)");
 
     // Device KEM keypair + self-encapsulation (returns pk, ct, ss)
@@ -445,7 +445,7 @@ pub struct HkdfStep5ZeroizeDemo {
 #[command]
 pub fn debug_hkdf_step5_zeroize_demo(
     db: State<AppDb>,
-    master_password: String
+    masterPassword: String
 ) -> Result<HkdfStep5ZeroizeDemo, String> {
     use hkdf::Hkdf;
     use sha2::Sha256;
@@ -462,7 +462,7 @@ pub fn debug_hkdf_step5_zeroize_demo(
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
 
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
+    pbkdf2_hmac::<Sha256>(masterPassword.as_bytes(), &salt_pw, 310_000, &mut k1);
 
     let ss_raw: Vec<u8> = {
         oqs::init();
@@ -540,7 +540,7 @@ fn hex4(bytes: &[u8]) -> String {
 }
 
 #[command]
-pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> Result<ZeroizePrintResult, String> {
+pub fn debug_step5_zeroize_print(db: State<AppDb>, masterPassword: String) -> Result<ZeroizePrintResult, String> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
@@ -558,7 +558,7 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
 
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
+    pbkdf2_hmac::<Sha256>(masterPassword.as_bytes(), &salt_pw, 310_000, &mut k1);
 
     let ss_raw: Vec<u8> = {
         oqs::init();
