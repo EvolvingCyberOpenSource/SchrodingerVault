@@ -160,7 +160,50 @@ pub fn greet(name: &str) -> String {
 
 #[derive(serde::Serialize)]
 pub struct Person { pub id: i32, pub name: String }
-// load commands for db 
+
+//TODO: add error handling, authentication 'middleware, and move queries to db.rs
+
+/// Input validation 
+// TODO: we may want to change some of these specifics later
+
+fn validate_label(label: &str) -> Result<String, String> {
+    let trimmed_label = label.trim();
+    if trimmed_label.is_empty() { return Err("Label is required".into()); }
+    if trimmed_label.len() > 128 { return Err("Label is too long (max 128)".into()); }
+    Ok(trimmed_label.to_string())
+}
+
+fn validate_username(username: &str) -> Result<String, String> {
+    let trimmed_username = username.trim();
+    if trimmed_username.is_empty() { return Err("Username is required".into()); }
+    if trimmed_username.len() > 256 { return Err("Username is too long (max 256)".into()); }
+    Ok(trimmed_username.to_string())
+}
+
+fn validate_password(password: &str) -> Result<String, String> {
+    if password.is_empty() { return Err("Password is required".into()); }
+    if password.len() > 10000 { return Err("Password is too long".into()); }
+    Ok(password.to_string())
+}
+
+fn validate_notes(opt: &Option<String>) -> Result<Option<String>, String> {
+    if let Some(notes) = opt {
+        let trimmed_notes = notes.trim();
+        if trimmed_notes.len() > 2_000 {
+            return Err("Notes are too long (max 2000)".into());
+        }
+        if trimmed_notes.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed_notes.to_string()))
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+
+//function called to add a person to the database
 #[command]
 pub fn add_person(db: State<AppDb>, name: String) -> Result<(), String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
