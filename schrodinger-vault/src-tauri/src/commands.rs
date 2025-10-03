@@ -4,9 +4,9 @@ use crate::state::AppDb;
 use crate::vault_core::db::db_path;
 use tauri::AppHandle;
 use std::mem;
+use crate::vault_core::db::{self, EntryListItem, NewEntry};
 
-use rand::{rng, RngCore}; // ran
-// d 0.9: rng() + RngCore::fill_bytes
+use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 
@@ -26,8 +26,6 @@ use secrecy::{SecretString, ExposeSecret};
 // AES-256 vault key lives only in RAM for this process lifetime.
 // We never serialize this; app restart -> key is gone until user logs in again.
 static VAULT_AES_KEY: OnceLock<[u8; 32]> = OnceLock::new();
-
-//Utilities
 
 /// Write a secret key file with tight permissions:
 /// - Unix/macOS: 0600
@@ -151,7 +149,7 @@ fn ensure_db_on_disk(app: &AppHandle, db: &State<AppDb>) -> Result<(), String> {
     Ok(())
 }
 
-// previous Examples
+//Examples / Demo
 
 #[command]
 pub fn greet(name: &str) -> String {
@@ -161,10 +159,7 @@ pub fn greet(name: &str) -> String {
 #[derive(serde::Serialize)]
 pub struct Person { pub id: i32, pub name: String }
 
-//TODO: add error handling, authentication 'middleware, and move queries to db.rs
-
-/// Input validation 
-// TODO: we may want to change some of these specifics later
+//Input validation
 
 fn validate_label(label: &str) -> Result<String, String> {
     let trimmed_label = label.trim();
@@ -202,8 +197,8 @@ fn validate_notes(opt: &Option<String>) -> Result<Option<String>, String> {
     }
 }
 
+//People demo (unchanged)
 
-//function called to add a person to the database
 #[command]
 pub fn add_person(db: State<AppDb>, name: String) -> Result<(), String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -235,7 +230,7 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
     Ok(out)
 }
 
-// Vault Storage Init (Step 6/7) 
+// Vault Storage Init (Step 6/7)
 
 /// Create the vault DB file with private perms and ensure tables exist.
 #[command]
@@ -273,7 +268,7 @@ pub fn init_vault_storage(app: AppHandle, db: State<AppDb>) -> Result<String, St
         "#
     ).map_err(|e| e.to_string())?;
 
-    // === FIX: swap the live AppDb connection to this on-disk file ===
+    //  FIX: swap the live AppDb connection to this on-disk file 
     {
         let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
         let _old = std::mem::replace(&mut *guard, conn);
@@ -283,7 +278,7 @@ pub fn init_vault_storage(app: AppHandle, db: State<AppDb>) -> Result<String, St
     Ok(format!("vault DB ready at {}", p.to_string_lossy()))
 }
 
-// Vault Init (Step 5 blended into Step 6/7)
+//Vault Init (Step 5 blended into Step 6/7)
 
 #[command]
 pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
@@ -295,7 +290,7 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
     ensure_db_on_disk(&app, &db)?;
 
     // Ensure DB file and tables exist before we write meta.
-    // === FIX: also ensures the live connection is bound to the file ===
+    // FIX: also ensures the live connection is bound to the file
     let _ = init_vault_storage(app.clone(), db.clone())?;
 
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -344,7 +339,6 @@ pub fn create_vault(app: AppHandle, db: State<AppDb>, master_password: String) -
     println!("(debug) derived AES-256 key (32 bytes) in RAM");
 
     // Install AES key into process RAM for this session.
-    // If it's already set (vault already opened), we won't overwrite it.
     let _ = VAULT_AES_KEY.set(aes_key_tmp);
 
     // Zeroize sensitive inputs immediately (K1, ss, IKM only; AES stays in RAM)
@@ -421,7 +415,7 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     ))
 }
 
-// Debug / Demo Helpers 
+//Debug / Demo Helpers
 
 #[derive(serde::Serialize)]
 pub struct KemStatus {
@@ -568,13 +562,12 @@ pub fn debug_reset_vault_hard(app: AppHandle, db: State<AppDb>) -> Result<bool, 
         println!("(reset) db file already missing");
     }
 
-    // === FIX: Recreate DB file + schema and rebind live connection to it ===
+    // FIX: Recreate DB file + schema and rebind live connection to it
     let _ = init_vault_storage(app.clone(), db.clone())?;
 
     println!("(reset) hard reset done (entries wiped, keystore removed, meta cleared, db file removed)");
     Ok(true)
 }
-
 
 // Extra “RAM-only” proof: DB does NOT have key material
 #[derive(serde::Serialize)]
@@ -811,4 +804,69 @@ pub fn debug_db_path() -> Result<DbPathInfo, String> {
     let exists = p.exists();
     let size = if exists { fs::metadata(&p).ok().map(|m| m.len()) } else { None };
     Ok(DbPathInfo { path: p.to_string_lossy().to_string(), exists, size })
+}
+
+//Vault CRUD (merged from second file) 
+
+#[command]
+pub fn vault_list(db: State<AppDb>) -> Result<Vec<EntryListItem>, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    db::list_entries(&conn).map_err(|e| e.to_string())
+}
+
+#[command]
+pub fn vault_add(
+    db: State<AppDb>,
+    label: String,
+    username: String,
+    password: String,
+    notes: Option<String>,
+) -> Result<EntryListItem, String> {
+    let label = validate_label(&label)?;
+    let username = validate_username(&username)?;
+    let password = validate_password(&password)?;
+    let notes = validate_notes(&notes)?;
+
+    // TODO: Replace with real AES-256-GCM using VAULT_AES_KEY and 12-byte random nonce.
+    // TEMP placeholder: nonce all-zero, ciphertext = plaintext password bytes
+    let _r = rng(); // keeping rng imported; use for real nonce later
+    let nonce = [0u8; 12];
+    let ciphertext_bytes = password.into_bytes();
+
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let new = NewEntry {
+        label: &label,
+        username: &username,
+        notes: notes.as_deref(),
+        nonce: &nonce,
+        ciphertext: &ciphertext_bytes,
+    };
+    db::add_entry(&conn, new).map_err(|e| e.to_string())
+}
+
+#[command]
+pub fn vault_get(db: State<AppDb>, id: i64) -> Result<String, String> {
+    if id <= 0 {
+        return Err("Invalid id".into());
+    }
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    match db::temp_get_ciphertext(&conn, id) {
+        Ok(Some(secret)) => Ok(secret),
+        Ok(None) => Err("No entry found with that id".into()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[command]
+pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
+    if id <= 0 {
+        return Err("Invalid id".into());
+    }
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let n = db::delete_entry(&conn, id).map_err(|e| e.to_string())?;
+    if n == 0 {
+        Err("No entry found with that id".into())
+    } else {
+        Ok(())
+    }
 }
