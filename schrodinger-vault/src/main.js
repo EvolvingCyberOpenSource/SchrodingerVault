@@ -190,6 +190,8 @@ async function userExists(){
 // this is immediately called when the web page is loaded
 window.addEventListener("DOMContentLoaded", async () => {
 
+  window.location.replace("unlock.html");
+
   // check if a user even exists
   // if not, redirect to create password/vault page
   // const exists = await userExists();

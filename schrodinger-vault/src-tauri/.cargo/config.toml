@@ -1,0 +1,6 @@
+[env]
+OPENSSL_DIR = "/opt/homebrew/opt/openssl@3"
+PKG_CONFIG_PATH = "/opt/homebrew/opt/openssl@3/lib/pkgconfig"
+LIBRARY_PATH = "/opt/homebrew/opt/openssl@3/lib"
+CPATH = "/opt/homebrew/opt/openssl@3/include"
+

@@ -9,10 +9,18 @@ mod vault_core;
 // import rust tools and tauri
 use tauri::{self, Manager};
 
-// build and returns the app with plugins and commands with webview
+/// Builds the Tauri app and sets everything up.
+///
+/// This function creates the main Tauri application builder.  
+/// It runs setup code to open the database, store the connection so other
+/// commands can use it, adds the opener plugin, and registers all the app’s
+/// command functions.
+///
+/// # Returns
+/// A ready to run Tauri app builder.
 fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
-        .setup(|app| { //adding additional setup steps here such as db setup
+        .setup(|app| {
             // create a connection to the database calling the function in vault_core/db.rs
             let conn = crate::vault_core::db::open_and_init(&app.handle())
                 .expect("DB init failed");
@@ -29,6 +37,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::list_people,
             commands::user_exists,
             commands::create_vault,
+            commands::unlock_vault,
             commands::vault_list,
             commands::vault_add,
             commands::vault_get,
@@ -44,10 +53,10 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
         ])
 }
 
-// this line just for mobile, ignored on desktop
+/// Launches the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // calls build_app function above
+    // calls build_app function above to build the application then runs it
     build_app()
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
