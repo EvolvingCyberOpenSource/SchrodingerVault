@@ -168,8 +168,20 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     await loadEntries();
   } catch (err) {
-    console.error("Init check failed:", err);
-    // Safe fallback: assume first run
-    window.location.replace("create.html");
+
+    console.log("Error checking user existence:", err);
+    return false;
+  
   }
+}
+
+// this is immediately called when the web page is loaded
+window.addEventListener("DOMContentLoaded", async () => {
+
+  // check if a user even exists
+  // if not, redirect to create password/vault page
+  // const exists = await userExists();
+  // if (!exists){
+  //   window.location.replace("create.html");
+  // } 
 });

@@ -20,6 +20,11 @@ use zeroize::Zeroize;
 use dirs;
 use secrecy::{SecretString, ExposeSecret};
 
+
+// TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!), 
+// we will need to refactor and organize functions into other files when the core functionality is done 
+// and call them here. and also add documentation and refine comments
+
 // =========================
 // Session AES key (RAM-only)
 // =========================
@@ -209,6 +214,59 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, masterPassword: String) -
 
     println!("(debug) salts + kdf + kem public material stored; SK on disk.");
     println!("== create_vault done ==");
+    Ok(true)
+}
+
+#[command]
+pub fn unlock_vault(app: AppHandle, db: State<AppDb>, password: String) -> Result<bool, String> {
+    println!("== unlock_vault ==");
+    println!("password: (len {})", password.len());
+
+    let master_password = SecretString::from(password);
+
+    // getting salt_pw and kdf info from meta table
+    let (salt_pw_b64, kdf_label, kdf_params_json): (String, String, Option<String>) = {
+        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let get = |k: &str| -> Result<String, String> {
+            conn.query_row("SELECT value FROM meta WHERE key=?1", [k], |r| r.get::<_, String>(0))
+                .map_err(|_| format!("missing meta key: {k}"))
+        };
+        (
+            get("salt_pw")?,                         
+            get("kdf")?,                            
+            conn.query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| r.get::<_, String>(0))
+                .optional()
+                .map_err(|e| e.to_string())?,       
+        )
+    };
+
+    // decodeing salt_pw 
+    let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode failed")?;
+    println!("(debug) salt_pw len = {}", salt_pw.len());
+
+
+    // getting num of pbdkf2 iterations (uses 310_000 as a default)
+    let iterations: u32 = kdf_params_json
+    .as_deref()
+    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+    .and_then(|v| v.get("iterations").and_then(|i| i.as_u64()).map(|n| n as u32))
+    .unwrap_or(310_000);
+
+    // deriving k1
+    let mut k1 = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(
+        master_password.expose_secret().as_bytes(),
+        &salt_pw,
+        iterations,
+        &mut k1,
+    );
+
+
+    // TODO: 2. Recover the device secret: Get SS with (ML-KEM-768)
+
+
+    // zeroize k1 AFTER we do eveyrthing with the ss and stuff
+    k1.zeroize();
     Ok(true)
 }
 

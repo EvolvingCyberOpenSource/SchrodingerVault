@@ -2,7 +2,14 @@ use rusqlite::{Connection, Result, params, Row};
 use std::path::PathBuf;
 use tauri::{Manager, path::BaseDirectory};
 
-/// get the path for the SQLite database in the app's data directory
+
+/// Resolves the full path to the `vault.sqlite` database file.
+///
+/// # Arguments
+/// * `app` - a handle to the running Tauri application
+///
+/// # Returns
+/// The path to where the database file will be located on the system
 pub fn db_path(app: &tauri::AppHandle) -> PathBuf {
     app.path()
         .resolve("vault.sqlite", BaseDirectory::AppData)
@@ -33,13 +40,15 @@ pub struct NewEntry<'a> {
 pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
     let path = db_path(app);
 
+    // TODO: can get rid of this debug in the future
     println!("SQLite DB located at: {}", path.display());
 
-    // Ensure directory exists
+    // saftey check to ensure the directory where the db will be exists
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
 
+    // creates the database file (if it doesn't exist)
     let conn = Connection::open(path)?;
 
     // Good defaults for desktop apps (requires rusqlite >= 0.29)
@@ -75,7 +84,7 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
         [],
     )?;
 
-    // Table for entries
+    // TODO: remove later and replace with correct schema in another function and call that here instead
     conn.execute(
         "CREATE TABLE IF NOT EXISTS entries (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +108,14 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
     Ok(conn)
 }
 
-/// Query functions for entries table
+
+/// Query functions for entries table.
+///
+/// # Arguments
+/// * `conn` - connection to the SQLite database
+///
+/// # Returns
+/// A vector of `EntryListItem` structs representing all entries in the entry table
 pub fn list_entries(conn: &Connection) -> Result<Vec<EntryListItem>> {
     let mut stmt = conn.prepare(
         r#"
