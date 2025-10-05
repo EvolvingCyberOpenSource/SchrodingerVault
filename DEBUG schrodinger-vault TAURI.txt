@@ -65,6 +65,13 @@ schemas.forEach(t => {
   console.groupEnd();
 });
 
+debug command to test Step 2 without exposing ss, this returns only safe metadata
+If the device key is missing or ct_kem is corrupted, should  get a clear error string
+this debug command gives a safe, non-secret way to sanity check decapsulation
+(the real unlock path already returns user-friendly errors following step 2 instructions):
+
+await window.__TAURI__.core.invoke("debug_decapsulate_status")
+
 
 
 

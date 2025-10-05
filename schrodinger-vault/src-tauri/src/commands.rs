@@ -19,6 +19,7 @@ use std::sync::OnceLock; // hold AES_KEY in RAM for the session
 use zeroize::Zeroize;
 use dirs;
 use secrecy::{SecretString, ExposeSecret};
+use oqs::kem::Algorithm;
 
 
 // TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!), 
@@ -164,6 +165,16 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, masterPassword: String) -
         "(debug) pk_kem_bytes_len={}, ct_kem_bytes_len={}, ss_len={}",
         pk_kem_raw.len(), ct_kem_raw.len(), ss_buf.len()
     );
+    // ===== CURRENT DEMO HKDF (done at creation time) =====
+    // TODO STEP 3: Move HKDF + VAULT_AES_KEY.set() to `unlock_vault` instead.
+    // At creation, we should:
+    //   - Generate/store salts and ML-KEM public/ct only (meta)
+    //   - Write secret key to keystore
+    //   - Do NOT derive/install the AES session key here
+    //
+    // When Step 3 is implemented in unlock, delete this HKDF block and only keep:
+    //   - meta writes for salts/kdf/pk_kem/ct_kem/kem_alg/alg
+    //   - zeroize any temp secrets
 
     // Step 5: Blend K1 and ss via HKDF-SHA256:
     // HKDF-Extract with K1
@@ -217,6 +228,87 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, masterPassword: String) -
     Ok(true)
 }
 
+
+// Step 2 helper — Recover device secret (ss) using ML-KEM-768
+
+/// Step 2: Recover the device-bound shared secret (ss) by decapsulating ML-KEM-768.
+/// Inputs:
+///   - ct_kem (Base64) from meta
+///   - sk_kem (raw bytes) from keystore (0600 perms on Unix, per-user ACL on Windows)
+/// Output:
+///   - 32-byte ss (in RAM only). The caller is responsible for zeroizing it after use.
+/// Errors:
+///   - Missing device SK → "device secret key missing; vault cannot unlock on this device"
+///   - Corrupted/invalid ciphertext → "decapsulate failed ..."
+// ===================================================================
+// Step 2 helper — Recover device secret (ss) via ML-KEM-768 (fixed API)
+// ===================================================================
+
+/// Step 2: Recover the device-bound shared secret (ss) by decapsulating ML-KEM-768.
+/// Inputs:
+///   - ct_kem (Base64) from meta
+///   - sk_kem (raw bytes) from keystore (0600 perms on Unix, per-user ACL on Windows)
+/// Output:
+///   - 32-byte ss (in RAM only). The caller is responsible for zeroizing it after use.
+/// Errors:
+///   - Missing device SK → "device secret key missing; vault cannot unlock on this device"
+///   - Corrupted/invalid ciphertext → "decapsulation failed ..." or length/decoding errors
+fn recover_device_secret(db: &State<AppDb>) -> Result<[u8; 32], String> {
+    use oqs::kem::{Algorithm, Kem};
+
+    // 1) Fetch ct_kem (b64) from meta
+    let ct_kem_b64: String = {
+        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        conn.query_row(
+            "SELECT value FROM meta WHERE key='ct_kem'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|_| "missing meta key: ct_kem".to_string())?
+    };
+
+    // 2) Decode ct_kem
+    let ct_kem_bytes = B64
+        .decode(ct_kem_b64.as_bytes())
+        .map_err(|_| "ct_kem decode failed".to_string())?;
+
+    // 3) Load device SK from keystore
+    let sk_path = keystore_path().map_err(|e| format!("keystore path: {e}"))?;
+    if !sk_path.exists() {
+        return Err("device secret key missing; vault cannot unlock on this device".into());
+    }
+    let mut sk_bytes = fs::read(&sk_path).map_err(|e| format!("read device secret key: {e}"))?;
+
+    // 4) KEM decapsulation → ss (32 bytes)
+    oqs::init();
+    let kem = Kem::new(Algorithm::MlKem768).map_err(|e| format!("kem new: {e}"))?;
+
+    // Build *validated* refs from raw bytes via Kem helpers
+    let sk_ref = kem
+        .secret_key_from_bytes(&sk_bytes)
+        .ok_or_else(|| "secret key length invalid/corrupted".to_string())?;
+    let ct_ref = kem
+        .ciphertext_from_bytes(&ct_kem_bytes)
+        .ok_or_else(|| "ciphertext length invalid/corrupted".to_string())?;
+
+    let ss_vec = kem
+        .decapsulate(sk_ref, ct_ref)
+        .map_err(|e| format!("decapsulation failed (ciphertext may be corrupted): {e}"))?;
+
+    // Copy to fixed-size array
+    if ss_vec.as_ref().len() != 32 {
+        return Err(format!("unexpected ss length: {}", ss_vec.as_ref().len()));
+    }
+    let mut ss = [0u8; 32];
+    ss.copy_from_slice(ss_vec.as_ref());
+
+    // Zeroize sensitive SK bytes read from disk
+    sk_bytes.zeroize();
+
+    Ok(ss)
+}
+
+
 #[command]
 pub fn unlock_vault(app: AppHandle, db: State<AppDb>, password: String) -> Result<bool, String> {
     println!("== unlock_vault ==");
@@ -260,10 +352,33 @@ pub fn unlock_vault(app: AppHandle, db: State<AppDb>, password: String) -> Resul
         iterations,
         &mut k1,
     );
+      println!("(debug) derived K1 successfully"); //debug print statement to see if K1 is derived successfully
 
-
-    // TODO: 2. Recover the device secret: Get SS with (ML-KEM-768)
-
+    // Implemented: Step 2 decapsulation to recover ss (RAM-only). check recover_device_secret function above unlock_vault command
+    match recover_device_secret(&db) {
+        Ok(ss) => {
+            println!("(debug) decapsulation OK; ss_len = {}", ss.len());
+            // IMPORTANT: Do not persist or log ss. Caller for Step 3 will consume it immediately.
+            // Since Step 3 is handled by another teammate, we explicitly zeroize our local copy here.
+            let mut ss_zero = ss;
+// TODO STEP 3: Derive AES-256 key (RAM-only) via HKDF-SHA256 using K1 || ss
+// - Load `salt_kdf` from meta (already stored during create_vault).
+// - HKDF-Extract(PRK = HMAC_SHA256(salt_kdf, K1 || ss))
+// - HKDF-Expand to 32 bytes with info="vault-key" → AES-256 key
+// - VAULT_AES_KEY.set(derived_key)  // set session key (OnceLock)
+// - Immediately zeroize K1 and ss buffers
+// - Return Ok(true) on success
+//
+// Note: When Step 3 is implemented here, remove the sessionStorage unlock in the frontend(main.js+7unlock.js)
+// and let main.js use `debug_vault_key_status` to decide if the vault is unlocked.
+// Also: never persist or log the derived AES key.
+            ss_zero.zeroize();
+        }
+        Err(e) => {
+            // Explicit, user-friendly error if SK missing or ct_kem corrupted
+            return Err(e);
+        }
+    }
 
     // zeroize k1 AFTER we do eveyrthing with the ss and stuff
     k1.zeroize();
@@ -770,6 +885,61 @@ pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
     }
 
     Ok(out)
+}
+
+// ===================================================================
+// NEW: Debug decapsulation status (no secret returned)
+// ===================================================================
+
+#[derive(serde::Serialize)]
+pub struct DecapStatus {
+    pub sk_path: String,
+    pub sk_exists: bool,
+    pub ct_kem_len: usize,
+    pub ss_len: usize,
+    pub ok: bool,
+}
+
+/// Debug helper: run decapsulation and report sizes/status, but never return the secret.
+#[tauri::command]
+pub fn debug_decapsulate_status(db: State<AppDb>) -> Result<DecapStatus, String> {
+    // info for reporting
+    let sk_path = keystore_path().map_err(|e| e.to_string())?;
+    let sk_exists = sk_path.exists();
+
+    // ct_kem length (decoded)
+    let ct_kem_len = {
+        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let ct_b64: Option<String> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='ct_kem'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        match ct_b64 {
+            Some(s) => B64.decode(s.as_bytes()).map(|v| v.len()).unwrap_or(0),
+            None => 0,
+        }
+    };
+
+    // Attempt decapsulation (does NOT expose the secret)
+    match recover_device_secret(&db) {
+        Ok(ss) => {
+            let ss_len = ss.len();
+            let mut ss_zero = ss;
+            ss_zero.zeroize();
+            Ok(DecapStatus {
+                sk_path: sk_path.to_string_lossy().to_string(),
+                sk_exists,
+                ct_kem_len,
+                ss_len,
+                ok: true,
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 // =========================

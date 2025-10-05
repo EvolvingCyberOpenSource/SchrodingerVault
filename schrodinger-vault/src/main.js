@@ -154,34 +154,42 @@ async function addEntry() {
   }
 }
 
+
+// TODO STEP 3: After implementing VAULT_AES_KEY in unlock_vault,
+// use `debug_vault_key_status` as the single source of truth for
+// whether the session is unlocked (no client-side flags).
 // --- send to create.html if vault not initialized ---
+// --- route to create.html (first time) or unlock.html (if vault already initialized))
 window.addEventListener("DOMContentLoaded", async () => {
   try {
-    // Use existing debug_kem_status to detect first run:
-    // initialized if we have SK file OR KEM pub/ct saved.
-    const s = await invoke("debug_kem_status"); // { sk_exists, pk_kem_bytes_len, ct_kem_bytes_len, ... }
+    // 1) Is vault initialized? If not, go create one.
+    const s = await invoke("debug_kem_status"); 
     const initialized = s && (s.sk_exists || s.pk_kem_bytes_len > 0 || s.ct_kem_bytes_len > 0);
-
     if (!initialized) {
       return window.location.replace("create.html");
     }
 
+    // 2) Is this session unlocked? (Step 3 not implemented yet, so we use sessionStorage)
+
+    // TODO STEP 3: Replace sessionStorage check with a backend check:
+    // const { loaded } = await invoke("debug_vault_key_status");
+    // if (!loaded) return window.location.replace("unlock.html");
+    // After Step 3, remove the sessionStorage fallback entirely.
+    const unlocked = sessionStorage.getItem("vault_unlocked") === "1";
+    if (!unlocked) {
+      return window.location.replace("unlock.html");
+    }
+
+    // 3) Good to load entries
     await loadEntries();
   } catch (err) {
-
-    console.log("Error checking user existence:", err);
-    return false;
-  
+    console.error("Init check failed:", err);
+    // If anything goes sideways, send to unlock to be safe.
+    window.location.replace("unlock.html");
   }
-}
-
-// this is immediately called when the web page is loaded
-window.addEventListener("DOMContentLoaded", async () => {
-
-  // check if a user even exists
-  // if not, redirect to create password/vault page
-  // const exists = await userExists();
-  // if (!exists){
-  //   window.location.replace("create.html");
-  // } 
 });
+
+// above should be adjusted for step 3 when implemented:
+// We’re not setting VAULT_AES_KEY until Step 3, entries page can’t rely on that to know you’re unlocked.(but should for step 3)
+//sessionStorage is a temporary session flag set by unlock.js and checked by main.js. 
+// It keeps you on the entries page after a successful unlock and clears automatically when the app/window restarts.
