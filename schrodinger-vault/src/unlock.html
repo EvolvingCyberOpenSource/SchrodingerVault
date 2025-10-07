@@ -1,24 +1,27 @@
 <!doctype html>
 <html lang="en">
-  <head>
+
+<head>
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="./styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tauri App</title>
     <script type="module" src="./unlock.js" defer></script>
-  </head>
+</head>
 
-  <body>
+<body>
 
     <main id="page-unlock" class="page container">
-      <h1>Unlock</h1>
-      <h2>Enter your master password</h2>
-      <form id="unlock-form">
-        <input id="password" type="password" placeholder="Master password" required />
-        <button type="submit">Unlock</button>
-      </form>
-      <p id="unlock-msg"></p>
+        <h1>Unlock</h1>
+        <h2 class="subtitle">Enter your master password</h2>
+        <form id="unlock-form">
+            <input id="password" type="password" placeholder="Master password" required />
+            <button type="submit">Unlock</button>
+        </form>
+        <p id="unlock-msg"></p>
     </main>
 
-  </body>
+</body>
+
+
 </html>
