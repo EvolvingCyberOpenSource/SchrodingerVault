@@ -10,11 +10,12 @@
 </head>
 
 <body>
-
-    <main id="page-home" class="container">
-        <h1>Schrodinger's Vault</h1>
+    <main id="page-home">
+        <h1>Schrödinger's Vault</h1>
 
         <!-- Add entry form -->
+
+        <h2 class="subtitle">Create a New Entry</h2>
         <form id="add-entry" class="add-form">
             <input id="label" placeholder="Label" required />
             <input id="username" placeholder="Username" required />
@@ -24,11 +25,10 @@
         </form>
 
         <!-- List entries -->
-        <div id="entry-list" class="entry-list"></div>
-
+        <h2 class="subtitle">Accounts</h2>
+        <div id="entry-list" class="entry-list entries">
+        </div>
     </main>
-
-
 </body>
 
 </html>
