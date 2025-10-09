@@ -20,6 +20,7 @@ use zeroize::Zeroize;
 use dirs;
 use secrecy::{SecretString, ExposeSecret};
 use oqs::kem::Algorithm;
+use arboard::Clipboard;
 
 
 // TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!), 
@@ -863,7 +864,7 @@ pub struct TableSchema {
     pub columns: Vec<ColumnInfo>,
 }
 
-#[tauri::command]
+#[command]
 pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
 
@@ -919,7 +920,7 @@ pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
 }
 
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[command]
 pub fn debug_aes_key_exists() -> bool {
     VAULT_AES_KEY
         .read()
@@ -928,7 +929,7 @@ pub fn debug_aes_key_exists() -> bool {
 }
 
 #[cfg(debug_assertions)]
-#[tauri::command]
+#[command]
 pub fn debug_zeroize_aes_key() -> Result<(), String> {
     let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
 
@@ -962,7 +963,7 @@ pub struct DecapStatus {
 }
 
 /// Debug helper: run decapsulation and report sizes/status, but never return the secret.
-#[tauri::command]
+#[command]
 pub fn debug_decapsulate_status(db: State<AppDb>) -> Result<DecapStatus, String> {
     // info for reporting
     let sk_path = keystore_path().map_err(|e| e.to_string())?;
@@ -1103,4 +1104,18 @@ pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+#[command]
+pub fn copy_to_clipboard(text: String) -> Result<(), String> {
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+    clipboard.set_text(text).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[command]
+pub fn get_clipboard_text() -> Result<String, String> {
+    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+    let text = clipboard.get_text().map_err(|e| e.to_string())?;
+    Ok(text)
 }

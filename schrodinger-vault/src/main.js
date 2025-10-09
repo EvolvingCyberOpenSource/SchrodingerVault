@@ -39,12 +39,17 @@ async function showPassword(id, secretSpan, showBtn) {
 async function copyPassword(id) {
   try {
     const value = await invoke("vault_get", { id });
-    await navigator.clipboard.writeText(value);
+    try {
+       await invoke("copy_to_clipboard", { text: value });
+       console.log("copy to clipboard successful");
+    } catch(e) {
+      console.error('Failed to copy:', e);
+    }
     setTimeout(async () => {
       try {
-        const current_clipboard = await navigator.clipboard.readText();
+        const current_clipboard = await invoke("get_clipboard_text");
         if (current_clipboard === value) {
-          await navigator.clipboard.writeText("");
+          await invoke("copy_to_clipboard", { text: "" });
         }
       } catch (err) {
         console.log("Clipboard read error: ", err);
