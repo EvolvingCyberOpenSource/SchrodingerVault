@@ -73,6 +73,12 @@ this debug command gives a safe, non-secret way to sanity check decapsulation
 await window.__TAURI__.core.invoke("debug_decapsulate_status")
 
 
+debug commands for AES key within RwLock
+Check if AES key exists
+await window.__TAURI__.core.invoke('debug_aes_key_exists')
+
+Zeroize AES key
+await window.__TAURI__.core.invoke('debug_zeroize_aes_key')
 
 
 

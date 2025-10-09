@@ -15,7 +15,7 @@ use oqs; // high-level, safe wrappers
 use std::{fs, io, path::{Path, PathBuf}};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::OnceLock; // hold AES_KEY in RAM for the session
+use std::sync::RwLock; // hold AES_KEY in RAM for the session, better than OnceLock since RwLock can be zeroized
 use zeroize::Zeroize;
 use dirs;
 use secrecy::{SecretString, ExposeSecret};
@@ -30,7 +30,50 @@ use oqs::kem::Algorithm;
 // Session AES key (RAM-only)
 // =========================
 
-static VAULT_AES_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+pub static VAULT_AES_KEY: RwLock<Option<[u8; 32]>> = RwLock::new(None);
+
+// =========================
+// RwLock helper functions
+// =========================
+
+// Installs AES key in RAM by reference to avoid stack copy
+pub fn install_aes_key(key: &[u8; 32]) -> Result<(), &'static str> {
+    let mut guard = VAULT_AES_KEY.write().map_err(|_| "lock poisoned")?;
+    *guard = Some(*key);
+    Ok(())
+}
+
+
+// Reads currently installed AES key. Creates a stack copy, caller must zeroize.
+fn get_aes_key() -> Result<[u8; 32], &'static str> {
+    let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
+    guard
+        .as_ref()
+        .ok_or("vault locked")
+        .map(|key| *key)
+}
+
+// Alternate function to get_aes_key which returns a reference instead of a stack copy, no need to zeroize.
+// Must use a guard when using this function. When guard is dropped the reference disppears.
+
+// Example:
+// let guard = get_aes_key_ref()?;
+// let aes_key = guard.as_ref();
+fn get_aes_key_ref<'a>() -> Result<std::sync::RwLockReadGuard<'a, Option<[u8; 32]>>, &'static str> {
+    VAULT_AES_KEY.read().map_err(|_| "lock poisoned")
+}
+
+
+// Zeroizes currently installed AES key
+fn zeroize_aes_key() -> Result<(), &'static str> {
+    let mut guard = VAULT_AES_KEY.write().map_err(|_| "lock poisoned")?;
+    if let Some(mut key) = guard.take() {
+        key.zeroize();
+    }
+    Ok(())
+}
+
 
 // =========================
 // Keystore helpers (KEM SK)
@@ -129,10 +172,10 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
 // =========================
 
 #[command]
-pub fn create_vault(_app: AppHandle, db: State<AppDb>, masterPassword: String) -> Result<bool, String> {
-    let masterPassword = SecretString::from(masterPassword);
+pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
+    let master_password = SecretString::from(master_password);
     println!("== create_vault ==");
-    println!("(debug) received password len = {}", masterPassword.expose_secret().len());
+    println!("(debug) received password len = {}", master_password.expose_secret().len());
 
     // Use the live, already-initialized connection
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -155,48 +198,16 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, masterPassword: String) -
     // PBKDF2 derive K1 (RAM only)
     let iterations: u32 = 310_000;
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(masterPassword.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
+    pbkdf2_hmac::<Sha256>(master_password.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
     println!("(debug) PBKDF2 derived K1 (32 bytes in RAM)");
 
     // Device KEM keypair + self-encapsulation (returns pk, ct, ss)
-    let (pk_kem_raw, ct_kem_raw, mut ss_buf) = generate_device_keypair()
+    let (pk_kem_raw, ct_kem_raw) = generate_device_keypair()
         .map_err(|e| e.to_string())?;
     println!(
-        "(debug) pk_kem_bytes_len={}, ct_kem_bytes_len={}, ss_len={}",
-        pk_kem_raw.len(), ct_kem_raw.len(), ss_buf.len()
+        "(debug) pk_kem_bytes_len={}, ct_kem_bytes_len={}",
+        pk_kem_raw.len(), ct_kem_raw.len()
     );
-    // ===== CURRENT DEMO HKDF (done at creation time) =====
-    // TODO STEP 3: Move HKDF + VAULT_AES_KEY.set() to `unlock_vault` instead.
-    // At creation, we should:
-    //   - Generate/store salts and ML-KEM public/ct only (meta)
-    //   - Write secret key to keystore
-    //   - Do NOT derive/install the AES session key here
-    //
-    // When Step 3 is implemented in unlock, delete this HKDF block and only keep:
-    //   - meta writes for salts/kdf/pk_kem/ct_kem/kem_alg/alg
-    //   - zeroize any temp secrets
-
-    // Step 5: Blend K1 and ss via HKDF-SHA256:
-    // HKDF-Extract with K1
-    let hk_k1 = Hkdf::<Sha256>::new(Some(&salt_kdf), &k1);
-    let mut prk1 = [0u8; 32];
-    hk_k1.expand(&[], &mut prk1).map_err(|e| e.to_string())?;
-
-    // HKDF-Extract again with ss, using prk1 as salt
-    let hk_final = Hkdf::<Sha256>::new(Some(&prk1), &ss_buf);
-
-    // Expand to AES key
-    let mut aes_key_tmp = [0u8; 32];
-    hk_final.expand(b"vault-key", &mut aes_key_tmp).map_err(|_| "HKDF expand failed")?;
-    println!("(debug) derived AES-256 key (32 bytes) in RAM");
-
-    // Install AES key into process RAM for this session.
-    let _ = VAULT_AES_KEY.set(aes_key_tmp);
-
-    // Zeroize sensitive inputs immediately (K1, ss, IKM only; AES stays in RAM)
-    k1.zeroize();
-    ss_buf.zeroize();
-    prk1.zeroize();
 
     // Base64 for TEXT meta
     let pk_kem_b64 = B64.encode(&pk_kem_raw);
@@ -310,7 +321,7 @@ fn recover_device_secret(db: &State<AppDb>) -> Result<[u8; 32], String> {
 
 
 #[command]
-pub fn unlock_vault(app: AppHandle, db: State<AppDb>, password: String) -> Result<bool, String> {
+pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Result<bool, String> {
     println!("== unlock_vault ==");
     println!("password: (len {})", password.len());
 
@@ -358,36 +369,54 @@ pub fn unlock_vault(app: AppHandle, db: State<AppDb>, password: String) -> Resul
     match recover_device_secret(&db) {
         Ok(ss) => {
             println!("(debug) decapsulation OK; ss_len = {}", ss.len());
-            // IMPORTANT: Do not persist or log ss. Caller for Step 3 will consume it immediately.
-            // Since Step 3 is handled by another teammate, we explicitly zeroize our local copy here.
             let mut ss_zero = ss;
-// TODO STEP 3: Derive AES-256 key (RAM-only) via HKDF-SHA256 using K1 || ss
-// - Load `salt_kdf` from meta (already stored during create_vault).
-// - HKDF-Extract(PRK = HMAC_SHA256(salt_kdf, K1 || ss))
-// - HKDF-Expand to 32 bytes with info="vault-key" → AES-256 key
-// - VAULT_AES_KEY.set(derived_key)  // set session key (OnceLock)
-// - Immediately zeroize K1 and ss buffers
-// - Return Ok(true) on success
-//
-// Note: When Step 3 is implemented here, remove the sessionStorage unlock in the frontend(main.js+7unlock.js)
-// and let main.js use `debug_vault_key_status` to decide if the vault is unlocked.
-// Also: never persist or log the derived AES key.
+
+            // Load salt_kdf in b64 from meta
+            let salt_kdf_b64: String = {
+                let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+                conn.query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| r.get::<_, String>(0))
+                    .map_err(|_| "missing meta key: salt_kdf")?
+            };
+
+            // Decode from b64
+            let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode failed")?;
+            println!("(debug) salt_kdf len = {}", salt_kdf.len());
+
+            // Blend K1 and ss via HKDF-SHA256
+            let hk_k1 = Hkdf::<Sha256>::new(Some(&salt_kdf), &k1);
+            let mut prk1 = [0u8; 32];
+            hk_k1.expand(&[], &mut prk1).map_err(|e| e.to_string())?;
+
+            // HKDF-Extract again with ss, using prk1 as salt
+            let hk_final = Hkdf::<Sha256>::new(Some(&prk1), &ss_zero);
+
+            // Expand to AES key
+            let mut aes_key_tmp = [0u8; 32];
+            hk_final.expand(b"vault-key", &mut aes_key_tmp).map_err(|_| "HKDF expand failed")?;
+            println!("(debug) derived AES-256 key (32 bytes) in RAM");
+
+            // Install AES key into process RAM for this session.
+            // let _ = VAULT_AES_KEY.set(aes_key_tmp);
+            let _ = install_aes_key(&aes_key_tmp);
+
+            // Zeroize sensitive inputs immediately
+            prk1.zeroize();
             ss_zero.zeroize();
+            k1.zeroize();
+
+            return Ok(true)
         }
         Err(e) => {
             // Explicit, user-friendly error if SK missing or ct_kem corrupted
+            k1.zeroize();
             return Err(e);
         }
     }
-
-    // zeroize k1 AFTER we do eveyrthing with the ss and stuff
-    k1.zeroize();
-    Ok(true)
 }
 
 /// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,
 /// writes SK to keystore with tight perms, and returns (pk_raw, ct_raw, ss).
-fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
     oqs::init();
 
     let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768)
@@ -400,14 +429,16 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
 
     let (ct_kem, ss_raw) = kem.encapsulate(&pk_kem)
         .map_err(|e| format!("encapsulate: {e}"))?;
-    let ss2 = kem.decapsulate(&sk_kem, &ct_kem)
-        .map_err(|e| format!("decapsulate: {e}"))?;
+    
+    // decapsulation step no longer needed
+    // let ss2 = kem.decapsulate(&sk_kem, &ct_kem)
+    //     .map_err(|e| format!("decapsulate: {e}"))?;
 
-    if ss_raw.as_ref() == ss2.as_ref() {
-        println!("(debug) shared secret match ({} bytes)", ss_raw.len());
-    } else {
-        println!("(debug) ERROR: shared secret mismatch!");
-    }
+    // if ss_raw.as_ref() == ss2.as_ref() {
+    //     println!("(debug) shared secret match ({} bytes)", ss_raw.len());
+    // } else {
+    //     println!("(debug) ERROR: shared secret mismatch!");
+    // }
 
     // Write SK securely to app-private keystore
     let sk_path = keystore_path().map_err(|e| format!("keystore_path: {e}"))?;
@@ -418,7 +449,6 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     Ok((
         pk_kem.as_ref().to_vec(),
         ct_kem.as_ref().to_vec(),
-        ss_raw.as_ref().to_vec(),
     ))
 }
 
@@ -618,7 +648,7 @@ pub struct HkdfStep5ZeroizeDemo {
 #[command]
 pub fn debug_hkdf_step5_zeroize_demo(
     db: State<AppDb>,
-    masterPassword: String
+    master_password: String
 ) -> Result<HkdfStep5ZeroizeDemo, String> {
     use hkdf::Hkdf;
     use sha2::Sha256;
@@ -635,7 +665,7 @@ pub fn debug_hkdf_step5_zeroize_demo(
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
 
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(masterPassword.as_bytes(), &salt_pw, 310_000, &mut k1);
+    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
 
     let ss_raw: Vec<u8> = {
         oqs::init();
@@ -713,7 +743,7 @@ fn hex4(bytes: &[u8]) -> String {
 }
 
 #[command]
-pub fn debug_step5_zeroize_print(db: State<AppDb>, masterPassword: String) -> Result<ZeroizePrintResult, String> {
+pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> Result<ZeroizePrintResult, String> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
@@ -731,7 +761,7 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, masterPassword: String) -> Re
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
 
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(masterPassword.as_bytes(), &salt_pw, 310_000, &mut k1);
+    pbkdf2_hmac::<Sha256>(master_password.as_bytes(), &salt_pw, 310_000, &mut k1);
 
     let ss_raw: Vec<u8> = {
         oqs::init();
@@ -801,7 +831,8 @@ pub struct VaultKeyStatus { pub loaded: bool }
 
 #[command]
 pub fn debug_vault_key_status() -> Result<VaultKeyStatus, String> {
-    Ok(VaultKeyStatus { loaded: VAULT_AES_KEY.get().is_some() })
+    let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
+    Ok(VaultKeyStatus { loaded: guard.is_some() })
 }
 
 #[derive(serde::Serialize)]
@@ -885,6 +916,36 @@ pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
     }
 
     Ok(out)
+}
+
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn debug_aes_key_exists() -> bool {
+    VAULT_AES_KEY
+        .read()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+#[cfg(debug_assertions)]
+#[tauri::command]
+pub fn debug_zeroize_aes_key() -> Result<(), String> {
+    let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
+
+    if guard.is_none() {
+        println!("No AES key stored in RwLock.");
+        return Ok(());
+    }
+
+    drop(guard);
+    println!("AES key found — zeroizing now...");
+
+    zeroize_aes_key().map_err(|e| e.to_string())?;
+
+    let guard_after = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
+    println!("Post-wipe AES key state: {:?}", guard_after);
+
+    Ok(())
 }
 
 // ===================================================================

@@ -52,6 +52,8 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_vault_key_status,
             commands::debug_list_schema,
             commands::debug_decapsulate_status,
+            commands::debug_aes_key_exists,
+            commands::debug_zeroize_aes_key,
         ])
 }
 

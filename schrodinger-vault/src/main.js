@@ -155,12 +155,8 @@ async function addEntry() {
 }
 
 
-// TODO STEP 3: After implementing VAULT_AES_KEY in unlock_vault,
-// use `debug_vault_key_status` as the single source of truth for
-// whether the session is unlocked (no client-side flags).
-// --- send to create.html if vault not initialized ---
-// --- route to create.html (first time) or unlock.html (if vault already initialized))
-window.addEventListener("DOMContentLoaded", async () => {
+window.addEventListener("DOMContentLoaded", async (e) => {
+  e.preventDefault();
   try {
     // 1) Is vault initialized? If not, go create one.
     const s = await invoke("debug_kem_status"); 
@@ -169,16 +165,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       return window.location.replace("create.html");
     }
 
-    // 2) Is this session unlocked? (Step 3 not implemented yet, so we use sessionStorage)
-
-    // TODO STEP 3: Replace sessionStorage check with a backend check:
-    // const { loaded } = await invoke("debug_vault_key_status");
-    // if (!loaded) return window.location.replace("unlock.html");
-    // After Step 3, remove the sessionStorage fallback entirely.
-    const unlocked = sessionStorage.getItem("vault_unlocked") === "1";
-    if (!unlocked) {
-      return window.location.replace("unlock.html");
-    }
+    // 2) Is this session unlocked?
+    const { loaded } = await invoke("debug_vault_key_status");
+    if (!loaded) return window.location.replace("unlock.html");
 
     // 3) Good to load entries
     await loadEntries();
@@ -189,7 +178,3 @@ window.addEventListener("DOMContentLoaded", async () => {
   }
 });
 
-// above should be adjusted for step 3 when implemented:
-// We’re not setting VAULT_AES_KEY until Step 3, entries page can’t rely on that to know you’re unlocked.(but should for step 3)
-//sessionStorage is a temporary session flag set by unlock.js and checked by main.js. 
-// It keeps you on the entries page after a successful unlock and clears automatically when the app/window restarts.
