@@ -22,6 +22,7 @@ use secrecy::{SecretString, ExposeSecret};
 use oqs::kem::Algorithm;
 use arboard::Clipboard;
 
+use aes_gcm::{Aes256Gcm, aead::{AeadInPlace, KeyInit, generic_array::GenericArray}, Nonce};
 
 // TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!), 
 // we will need to refactor and organize functions into other files when the core functionality is done 
@@ -75,6 +76,59 @@ fn zeroize_aes_key() -> Result<(), &'static str> {
     Ok(())
 }
 
+// ====================
+// AES-256-GCM helpers
+// ====================
+
+// Generate nonce
+fn new_nonce() -> [u8; 12] {
+    let mut n = [0u8; 12];
+    rand::rng().fill_bytes(&mut n);
+    n
+}
+// Holds the per-entry nonce, ciphertext, and authentication tag
+struct SealResult {
+    nonce: [u8; 12],
+    ciphertext: Vec<u8>,
+    tag: [u8; 16],
+}
+
+fn encrypt_password(aes_key: &[u8; 32], password_utf8: &str) -> Result<SealResult, String> {
+    let key = GenericArray::from_slice(aes_key);
+    let cipher = Aes256Gcm::new(key);
+
+    let nonce = new_nonce();
+    let nonce_ga = Nonce::from_slice(&nonce);
+
+    // In-place so we don't keep two plaintext copies
+    let mut buf = password_utf8.as_bytes().to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(nonce_ga, b"", &mut buf)
+        .map_err(|e| e.to_string())?;
+
+    let mut out_tag = [0u8; 16];
+    out_tag.copy_from_slice(tag.as_slice());
+
+    Ok(SealResult { nonce, ciphertext: buf, tag: out_tag })
+}
+
+fn decrypt_password(
+    aes_key: &[u8; 32],
+    nonce: &[u8; 12],
+    mut ciphertext: Vec<u8>,
+    tag: &[u8; 16],
+) -> Result<String, String> {
+    let key = GenericArray::from_slice(aes_key);
+    let cipher = Aes256Gcm::new(key);
+    let nonce_ga = Nonce::from_slice(nonce);
+    let tag_ga = GenericArray::from_slice(tag);
+
+    cipher
+        .decrypt_in_place_detached(nonce_ga, b"", &mut ciphertext, tag_ga)
+        .map_err(|_| "Couldn't decrypt entry. It may be corrupted or tampered.".to_string())?;
+
+    String::from_utf8(ciphertext).map_err(|_| "Decrypted data was not valid UTF-8".to_string())
+}
 
 // =========================
 // Keystore helpers (KEM SK)
@@ -1004,6 +1058,105 @@ pub fn debug_decapsulate_status(db: State<AppDb>) -> Result<DecapStatus, String>
     }
 }
 
+// ===============================
+// Debug Helpers for Step 2 part 5
+// ==============================
+
+#[derive(serde::Serialize)]
+pub struct EntryBlobInfo {
+    pub id: i64,
+    pub nonce_len: usize,
+    pub tag_len: usize,
+    pub ct_len: usize,
+    pub nonce_hex: String,
+    pub tag_hex: String,
+    pub ct_hex_prefix: String,
+    pub is_ct_mostly_printable: bool,
+}
+fn hex(bytes: &[u8], max: usize) -> String {
+    let mut s = String::new();
+    for b in bytes.iter().take(max) { use std::fmt::Write; let _ = write!(s, "{:02x}", b); }
+    s
+}
+// Checks if text is readable and therefore not encrypted
+fn mostly_printable(bytes: &[u8]) -> bool {
+    if bytes.is_empty() { return false; }
+    let printable = bytes.iter().filter(|&&b| (b >= 0x20 && b <= 0x7e) || b == b'\n').count();
+    (printable as f32) / (bytes.len() as f32) > 0.9
+}
+
+// report lengths + tiny hex previews of an entry’s nonce, ciphertext, tag to verify AES-GCM storage
+#[command]
+pub fn debug_entry_blob_info(db: State<AppDb>, id: i64) -> Result<EntryBlobInfo, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let (nonce, ct, tag): (Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
+        "SELECT nonce, ciphertext, tag FROM entries WHERE id=?1",
+        rusqlite::params![id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    ).map_err(|e| e.to_string())?;
+    Ok(EntryBlobInfo {
+        id,
+        nonce_len: nonce.len(),
+        tag_len: tag.len(),
+        ct_len: ct.len(),
+        nonce_hex: hex(&nonce, 12),
+        tag_hex: hex(&tag, 16),
+        ct_hex_prefix: hex(&ct, 16),
+        is_ct_mostly_printable: mostly_printable(&ct),
+    })
+}
+// Flips one byte in entry values to test AES_GCM tamper detection
+#[command]
+pub fn debug_tamper_entry(
+    db: State<AppDb>,
+    id: i64,
+    field: String,        
+    index: Option<i64>,   // flips byte 0 by default
+    xor: u8               // bit mask
+) -> Result<usize, String> {
+    let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let col = match field.as_str() {    // which columns to corrupt
+        "ciphertext" => "ciphertext",
+        "tag" => "tag",
+        "nonce" => "nonce",
+        other => return Err(format!("unknown field: {}", other)),
+    };
+    let mut blob: Vec<u8> = conn.query_row(
+        &format!("SELECT {} FROM entries WHERE id=?1", col),
+        rusqlite::params![id],
+        |r| r.get(0)
+    ).map_err(|e| e.to_string())?;
+    if blob.is_empty() { return Err("blob empty".into()); }
+    let i = index.unwrap_or(0) as usize;
+    if i >= blob.len() { return Err(format!("index {} out of range {}", i, blob.len())); }
+    blob[i] ^= xor;
+    let n = conn.execute(
+        &format!("UPDATE entries SET {}=?1 WHERE id=?2", col),
+        rusqlite::params![blob, id]
+    ).map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+#[derive(serde::Serialize)]
+pub struct CryptoSelfTest { 
+    pub nonce_len: usize, 
+    pub tag_len: usize, 
+    pub roundtrip_ok: bool }
+
+#[command]
+pub fn debug_crypto_selftest(pt: String) -> Result<CryptoSelfTest, String> {
+    let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
+    let k = guard.as_ref().ok_or("Vault is locked — unlock first")?;
+    let sealed = encrypt_password(k, &pt)?;
+    let out = decrypt_password(k, &sealed.nonce, sealed.ciphertext, &sealed.tag)?;
+    Ok(CryptoSelfTest {
+        nonce_len: sealed.nonce.len(),
+        tag_len: sealed.tag.len(),
+        roundtrip_ok: out == pt,
+    })
+}
+
+
 // =========================
 // Vault CRUD (placeholder crypto for now)
 // =========================
@@ -1063,18 +1216,25 @@ pub fn vault_add(
     let password = validate_password(&password)?;
     let notes = validate_notes(&notes)?;
 
-    // TODO: Replace with real AES-256-GCM using VAULT_AES_KEY and a 12-byte random nonce.
-    // TEMP placeholder: nonce all-zero, ciphertext = plaintext password bytes
-    let nonce = [0u8; 12];
-    let ciphertext_bytes = password.into_bytes();
+    // Uses VAULT_AES_KEY by reference 
+    let sealed = {
+        let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
+        let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
+        encrypt_password(aes_key_ref, &password)?
+    };
+
+    // Zeroize plaintext ASAP
+    let mut pw_bytes = password.into_bytes();
+    pw_bytes.zeroize();
 
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     let new = NewEntry {
         label: &label,
         username: &username,
         notes: notes.as_deref(),
-        nonce: &nonce,
-        ciphertext: &ciphertext_bytes,
+        nonce: &sealed.nonce,
+        ciphertext: &sealed.ciphertext,
+        tag: &sealed.tag,
     };
     db::add_entry(&conn, new).map_err(|e| e.to_string())
 }
@@ -1084,12 +1244,26 @@ pub fn vault_get(db: State<AppDb>, id: i64) -> Result<String, String> {
     if id <= 0 {
         return Err("Invalid id".into());
     }
+
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    match db::temp_get_ciphertext(&conn, id) {
-        Ok(Some(secret)) => Ok(secret),
-        Ok(None) => Err("No entry found with that id".into()),
-        Err(e) => Err(e.to_string()),
+    let enc = crate::vault_core::db::get_entry_encrypted(&conn, id)
+        .map_err(|e| e.to_string())?
+        .ok_or("No entry found with that id")?;
+
+    if enc.nonce.len() != 12 || enc.tag.len() != 16 {
+        return Err("Entry is corrupt (invalid nonce/tag size)".into());
     }
+    let mut nonce12 = [0u8; 12];  nonce12.copy_from_slice(&enc.nonce);
+    let mut tag16   = [0u8; 16];  tag16.copy_from_slice(&enc.tag);
+
+    // VAULT_AES_KEY passed by reference
+    let plaintext = {
+        let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
+        let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
+        decrypt_password(aes_key_ref, &nonce12, enc.ciphertext, &tag16)?
+    };
+
+    Ok(plaintext)
 }
 
 #[command]

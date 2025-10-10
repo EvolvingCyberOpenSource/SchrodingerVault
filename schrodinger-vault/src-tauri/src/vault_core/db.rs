@@ -33,8 +33,19 @@ pub struct NewEntry<'a> {
     pub username: &'a str,
     pub notes: Option<&'a str>,
     pub nonce: &'a [u8],
-    pub ciphertext: &'a [u8], // stores plain text for now
+    pub ciphertext: &'a [u8],
+    pub tag: &'a [u8],
 }
+
+#[derive(serde::Serialize)]
+pub struct EncEntry {
+    pub label: String,
+    pub username: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+    pub tag: Vec<u8>,
+}
+
 
 /// open the database and create schema if needed returning a connection object
 pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
@@ -93,6 +104,7 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
             notes       TEXT,
             nonce       BLOB NOT NULL,
             ciphertext  BLOB NOT NULL,
+            tag         BLOB NOT NULL,
             created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
             updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         )",
@@ -148,10 +160,10 @@ fn row_to_list_item(row: &Row) -> rusqlite::Result<EntryListItem> {
 pub fn add_entry(conn: &Connection, e: NewEntry) -> Result<EntryListItem> {
     conn.execute(
         r#"
-        INSERT INTO entries (label, username, notes, nonce, ciphertext)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO entries (label, username, notes, nonce, ciphertext, tag)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
-        params![e.label, e.username, e.notes, e.nonce, e.ciphertext],
+        params![e.label, e.username, e.notes, e.nonce, e.ciphertext, e.tag],
     )?;
 
     // Prepare to return added entry so it can be displayed in UI immediately
@@ -172,14 +184,22 @@ pub fn delete_entry(conn: &Connection, id: i64) -> Result<usize> {
     conn.execute("DELETE FROM entries WHERE id = ?1", params![id])
 }
 
-// TEMP: for now this just passes plain ciphertext as a string to demo show password function
-pub fn temp_get_ciphertext(conn: &Connection, id: i64) -> Result<Option<String>> {
-    let mut stmt = conn.prepare("SELECT ciphertext FROM entries WHERE id = ?1")?;
+
+pub fn get_entry_encrypted(conn: &Connection, id: i64) -> Result<Option<EncEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT label, username, nonce, ciphertext, tag FROM entries WHERE id = ?1"
+    )?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
-        let bytes: Vec<u8> = row.get(0)?;
-        Ok(Some(String::from_utf8_lossy(&bytes).to_string()))
+        Ok(Some(EncEntry {
+            label: row.get(0)?,
+            username: row.get(1)?,
+            nonce: row.get(2)?,
+            ciphertext: row.get(3)?,
+            tag: row.get(4)?,
+        }))
     } else {
         Ok(None)
     }
 }
+

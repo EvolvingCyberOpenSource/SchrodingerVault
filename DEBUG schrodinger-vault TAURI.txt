@@ -81,6 +81,21 @@ Zeroize AES key
 await window.__TAURI__.core.invoke('debug_zeroize_aes_key')
 
 
+debug commands for Step 2 part 5: 
+
+nonce, ciphertext, tag length and snippet to verify AES-GCM storage:
+
+await window.__TAURI__.core.invoke('debug_entry_blob_info', { id: e.id });
+
+Destructive, use on test entries and reset db afterwards:
+
+await window.__TAURI__.core.invoke('debug_tamper_entry', { id: e.id, field:'tag', index:0, xor:128 });
+await window.__TAURI__.core.invoke('vault_get', { id: e.id }); // should throw error
+
+check encryption/decryption:
+
+await window.__TAURI__.core.invoke('debug_crypto_selftest', { pt: 'hello123' });
+
 
 
 
