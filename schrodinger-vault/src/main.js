@@ -2,16 +2,17 @@
 const { invoke } = window.__TAURI__.core;
 
 const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
+const BULLETS = "••••••••";
 
 // --- Password reveal ---
 async function showPassword(id, secretSpan, showBtn) {
     try {
         showBtn.disabled = true;
         const value = await invoke("vault_get", { id });
-        secretSpan.textContent = `  ${value}`;
+        secretSpan.textContent = value;
         // auto-hide
         setTimeout(() => {
-            secretSpan.textContent = "";
+            secretSpan.textContent = BULLETS;
             showBtn.disabled = false;
         }, PASS_VIS_DURATION);
     } catch (err) {
@@ -59,31 +60,22 @@ async function deleteEntry(id, row, label) {
 
 // --- Make entry row ---
 function renderRow(e) {
-    const row = document.createElement("div");
-    row.className = "entry-row";
-    row.textContent = `${e.label} — ${e.username}${e.notes ? " — " + e.notes : ""}`;
+    const tpl = document.getElementById('entry-row-tpl');
+    const row = tpl.content.firstElementChild.cloneNode(true);
 
-    const secretSpan = document.createElement("span");
-    secretSpan.className = "secret";
-    row.appendChild(secretSpan);
+    row.dataset.id = e.id;
 
-    const showBtn = document.createElement("button");
-    showBtn.type = "button";
-    showBtn.textContent = "Show";
-    showBtn.addEventListener("click", () => showPassword(e.id, secretSpan, showBtn));
-    row.appendChild(showBtn);
+    row.querySelector('.entry-label').textContent = e.label;
+    row.querySelector('.entry-username').textContent = e.username;
+    row.querySelector('.entry-notes').textContent = (e.notes == null ? '' : e.notes);
 
-    const copyBtn = document.createElement("button");
-    copyBtn.type = "button";
-    copyBtn.textContent = "Copy password";
-    copyBtn.addEventListener("click", () => copyPassword(e.id));
-    row.appendChild(copyBtn);
+    const secretSpan = row.querySelector('.secret');
+    secretSpan.textContent = BULLETS;
+    const showBtn = row.querySelector('.show');
+    showBtn.addEventListener('click', () => showPassword(e.id, secretSpan, showBtn));
 
-    const delBtn = document.createElement("button");
-    delBtn.type = "button";
-    delBtn.textContent = "Delete";
-    delBtn.addEventListener("click", () => deleteEntry(e.id, row, e.label));
-    row.appendChild(delBtn);
+    row.querySelector('.copy').addEventListener('click', () => copyPassword(e.id));
+    row.querySelector('.delete').addEventListener('click', () => deleteEntry(e.id, row, e.label));
 
     return row;
 }

@@ -10,25 +10,63 @@
 </head>
 
 <body>
-    <main id="page-home">
+    <main id="page-home" class="left">
         <h1>Schrödinger's Vault</h1>
 
         <!-- Add entry form -->
-
-        <h2 class="subtitle">Create a New Entry</h2>
-        <form id="add-entry" class="add-form">
-            <input id="label" placeholder="Label" required />
-            <input id="username" placeholder="Username" required />
-            <input id="password" type="password" placeholder="Password" required />
-            <textarea id="notes" placeholder="Notes (optional)"></textarea>
-            <button type="submit">Add</button>
-        </form>
+        <section aria-labelledby="create-entry">
+            <h2 id="create-entry" class="h3">Create a New Entry</h2>
+            <form id="add-entry" class="add-form" autocomplete="off">
+                <div class="form-grid">
+                    <input id="label" name="label" placeholder="Label" required />
+                    <input id="username" name="username" placeholder="Username" required />
+                    <input id="password" name="password" type="password" placeholder="Password" required />
+                    <textarea id="notes" name="notes" placeholder="Notes (optional)"></textarea>
+                </div>
+                <button type="submit" class="btn-accent">Add</button>
+            </form>
+        </section>
 
         <!-- List entries -->
-        <h2 class="subtitle">Accounts</h2>
-        <div id="entry-list" class="entry-list entries">
-        </div>
+        <section aria-labelledby="accounts">
+            <h2 id="accounts" class="h3">Accounts</h2>
+
+            <!-- Header -->
+            <div class="entries">
+                <div class="entries-header" role="row">
+                    <div class="h-label" role="columnheader">Label</div>
+                    <div class="h-username" role="columnheader">Username</div>
+                    <div class="h-password" role="columnheader">Password</div>
+                    <div class="h-notes" role="columnheader">Notes</div>
+                    <div class="h-actions" role="columnheader">Actions</div>
+                </div>
+
+                <!-- Dynamic rows -->
+                <div id="entry-list" class="entry-list" role="rowgroup"></div>
+            </div>
+        </section>
+
+        <!-- Row template -->
+        <template id="entry-row-tpl">
+  <div class="entry-row" data-id="" role="row">
+    <div class="cell label" role="cell"><span class="entry-label"></span></div>
+    <div class="cell username" role="cell"><span class="entry-username"></span></div>
+    <div class="cell secret" role="cell" aria-live="polite" aria-atomic="true">
+      <span class="secret-text"></span>
+    </div>
+    <div class="cell notes" role="cell"><span class="entry-notes"></span></div>
+    <div class="cell actions" role="cell">
+      <div class="row-actions">
+        <button type="button" class="show btn-secondary">Show</button>
+        <button type="button" class="copy btn-accent">Copy</button>
+        <button type="button" class="delete">Delete</button>
+      </div>
+    </div>
+  </div>
+</template>
     </main>
+
+
 </body>
 
 </html>
