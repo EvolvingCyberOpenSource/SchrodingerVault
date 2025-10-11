@@ -1,27 +1,30 @@
 <!doctype html>
 <html lang="en">
-  <head>
+
+<head>
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="./styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tauri App</title>
     <script type="module" src="./create.js" defer></script>
-  </head>
+</head>
 
-  <body>
-    <main class="container">
-        <h1>Schrodinger's Vault</h1>
-        <h2>Create a Master Password</h2>
+<body>
+    <main class="page container">
+        <img src="assets/SV-logo-full.svg" alt="Schrödinger Vault logo" class="logo">
+        <h1>Schrödinger's Vault</h1>
+        <h2 class="subtitle">Create a Master Password</h2>
         <form id="passwordForm">
-        <input type="password" id="masterPassword" placeholder="Enter Master Password" required/>
-        <br />
-        <br />
-        <input type="password" id="confirmPassword" placeholder="Confirm Master Password" required/>
-        <br />
-        <br />
-        <button type="submit" id="createButton">Create Master Password</button>
-      </form>
-      <p id="create-msg"></p>
+            <input type="password" id="masterPassword" placeholder="Enter Master Password" required/>
+            <br />
+            <br />
+            <input type="password" id="confirmPassword" placeholder="Confirm Master Password" required/>
+            <br />
+            <br />
+            <button type="submit" id="createButton">Create Master Password</button>
+        </form>
+        <p id="create-msg"></p>
     </main>
-  </body>
+</body>
+
 </html>
