@@ -67,8 +67,18 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
 pub fn run() {
     // calls build_app function above to build the application then runs it
     build_app()
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                println!("App exit requested — cleaning up...");
+                commands::lock_vault();
+            }
+            tauri::RunEvent::Exit => {
+                println!("App exited.");
+            }
+            _ => {}
+        });
 }
 
 // entry point, calls run right above
