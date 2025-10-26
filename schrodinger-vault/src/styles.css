@@ -238,6 +238,29 @@ button:disabled {
 }
 
 
+/* === Toast === */
+
+#toast {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--accent);
+    color: var(--bg);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    opacity: 0;
+    transition: opacity .2s ease;
+    pointer-events: none;
+    z-index: 1000;
+}
+
+#toast.show {
+    opacity: 1;
+}
+
+
 /* === Index page layout === */
 
 #page-home {

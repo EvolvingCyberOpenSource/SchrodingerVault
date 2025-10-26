@@ -4,6 +4,10 @@ const { invoke } = window.__TAURI__.core;
 const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
 const BULLETS = "••••••••";
 
+// single clipboard timer and owner token
+let clipboardClearTimer = null;
+let clipboardOwnerToken = 0;
+
 // --- Password reveal ---
 async function showPassword(id, secretSpan, showBtn) {
     try {
@@ -21,24 +25,56 @@ async function showPassword(id, secretSpan, showBtn) {
     }
 }
 
+// -- Toast notification --
+function showToast(message, duration = 3000) {
+    const toast = document.getElementById("toast");
+    toast.textContent = message;
+    toast.classList.add("show");
+
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(() => {
+        toast.classList.remove("show");
+    }, duration);
+
+}
+
 // --- Copy password ---
 async function copyPassword(id) {
     try {
         const value = await invoke("vault_get", { id });
         try {
             await invoke("copy_to_clipboard", { text: value });
+            showToast("Copied");
             console.log("copy to clipboard successful");
         } catch (e) {
             console.error('Failed to copy:', e);
+            return;
         }
-        setTimeout(async() => {
+        // 
+        const myToken = ++clipboardOwnerToken;
+
+        // cancel any old timers for existing copy action
+        if (clipboardClearTimer) {
+            clearTimeout(clipboardClearTimer);
+            clipboardClearTimer = null;
+        }
+        // start countdown for latest copy
+        clipboardClearTimer = setTimeout(async() => {
+            // verify still latest copy 
+            if (myToken !== clipboardOwnerToken) return;
+
             try {
                 const current_clipboard = await invoke("get_clipboard_text");
                 if (current_clipboard === value) {
                     await invoke("copy_to_clipboard", { text: "" });
+                    showToast("Clipboard cleared");
                 }
             } catch (err) {
-                console.log("Clipboard read error: ", err);
+                console.log("Clipboard read/clear error:", err);
+            } finally {
+                if (myToken === clipboardOwnerToken) {
+                    clipboardClearTimer = null;
+                }
             }
         }, PASS_VIS_DURATION);
     } catch (err) {
