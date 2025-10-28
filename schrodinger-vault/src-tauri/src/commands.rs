@@ -69,10 +69,12 @@ fn get_aes_key_ref<'a>() -> Result<std::sync::RwLockReadGuard<'a, Option<[u8; 32
 
 // Zeroizes currently installed AES key
 fn zeroize_aes_key() -> Result<(), &'static str> {
-    let mut guard = VAULT_AES_KEY.write().map_err(|_| "lock poisoned")?;
-    if let Some(mut key) = guard.take() {
-        key.zeroize();
-    }
+    // let mut guard = VAULT_AES_KEY.write().map_err(|_| "lock poisoned")?;
+    // if let Some(mut key) = guard {
+    //     key.zeroize();
+    // }
+    let mut guard = VAULT_AES_KEY.write().unwrap();
+    guard.zeroize();
     Ok(())
 }
 
@@ -467,6 +469,15 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
             return Err(e);
         }
     }
+}
+
+#[command]
+pub fn lock_vault() {
+    println!("Locking vault");
+    zeroize_aes_key();
+    println!("zeroized aes key");
+    copy_to_clipboard("");
+    println!("clearing clipboard");
 }
 
 /// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,
@@ -973,7 +984,6 @@ pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
     Ok(out)
 }
 
-#[cfg(debug_assertions)]
 #[command]
 pub fn debug_aes_key_exists() -> bool {
     VAULT_AES_KEY
@@ -982,7 +992,6 @@ pub fn debug_aes_key_exists() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(debug_assertions)]
 #[command]
 pub fn debug_zeroize_aes_key() -> Result<(), String> {
     let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
@@ -1281,7 +1290,7 @@ pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
 }
 
 #[command]
-pub fn copy_to_clipboard(text: String) -> Result<(), String> {
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
     clipboard.set_text(text).map_err(|e| e.to_string())?;
     Ok(())
