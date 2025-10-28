@@ -154,6 +154,8 @@ async function addEntry() {
     const label = labelEl.value;
     const username = usernameEl.value;
     const password = passwordEl.value;
+    // clear sensitive DOM value immediately
+    passwordEl.value = "";
     const notesRaw = notesEl.value;
     const notes = notesRaw.trim().length ? notesRaw : null;
 
@@ -162,13 +164,15 @@ async function addEntry() {
         // clear inputs after add
         labelEl.value = "";
         usernameEl.value = "";
-        passwordEl.value = "";
         notesEl.value = "";
 
         // reload list with new entry
         await loadEntries();
     } catch (err) {
         console.log("Error adding entry: ", err);
+    } finally {
+        // ensure sensitive var is cleared
+        password = null;
     }
 }
 
