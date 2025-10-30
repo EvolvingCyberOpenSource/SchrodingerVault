@@ -23,10 +23,12 @@ use oqs::kem::Algorithm;
 use arboard::Clipboard;
 
 use aes_gcm::{Aes256Gcm, aead::{AeadInPlace, KeyInit, generic_array::GenericArray}, Nonce};
+use crate::error::{ErrorCode, VaultError}; // enums and structs for error handling
 
 // TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!), 
 // we will need to refactor and organize functions into other files when the core functionality is done 
 // and call them here. and also add documentation and refine comments
+
 
 // =========================
 // Session AES key (RAM-only)
@@ -256,6 +258,38 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
     pbkdf2_hmac::<Sha256>(master_password.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
     println!("(debug) PBKDF2 derived K1 (32 bytes in RAM)");
 
+
+    {
+        println!("(debug) verifying vault in create vault");
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, OsRng, rand_core::RngCore}};
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+        let verifier_plain = b"vault-ok";
+        let cipher = Aes256Gcm::new_from_slice(&k1).unwrap();
+
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+
+        let verifier_ct = cipher
+            .encrypt(&nonce.into(), verifier_plain.as_ref())
+            .expect("verifier encryption failed");
+
+        println!("(debug) going to store verifier_nonce in meta");
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('verifier_nonce', ?1)",
+            [B64.encode(&nonce)],
+        ).map_err(|_| "insert verifier_nonce failed")?;
+
+        println!("(debug) going to store verifier_ct in meta");
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('verifier_ct', ?1)",
+            [B64.encode(&verifier_ct)],
+        ).map_err(|_| "insert verifier_ct failed")?;
+
+        println!("(debug) verifier created and stored in meta");
+    }
+    
+
     // Device KEM keypair + self-encapsulation (returns pk, ct, ss)
     let (pk_kem_raw, ct_kem_raw) = generate_device_keypair()
         .map_err(|e| e.to_string())?;
@@ -419,6 +453,46 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
         &mut k1,
     );
       println!("(debug) derived K1 successfully"); //debug print statement to see if K1 is derived successfully
+
+      {
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+        use aes_gcm::aead::generic_array::GenericArray;
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    
+        // Fetch verifier data from DB
+        let (nonce_b64, ct_b64): (String, String) = {
+            let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+            (
+                conn.query_row("SELECT value FROM meta WHERE key='verifier_nonce'", [], |r| r.get::<_, String>(0))
+                    .map_err(|_| "missing verifier_nonce")?,
+                conn.query_row("SELECT value FROM meta WHERE key='verifier_ct'", [], |r| r.get::<_, String>(0))
+                    .map_err(|_| "missing verifier_ct")?,
+            )
+        };
+    
+        // Decode Base64 verifier data
+        let nonce = B64.decode(&nonce_b64).map_err(|_| "nonce decode failed")?;
+        let ct = B64.decode(&ct_b64).map_err(|_| "verifier_ct decode failed")?;
+    
+        // Convert nonce into AES-GCM GenericArray (required by decrypt)
+        let nonce_ga = GenericArray::from_slice(&nonce);
+    
+        // Attempt to decrypt verifier with derived K1
+        let cipher = Aes256Gcm::new_from_slice(&k1).map_err(|_| "cipher init failed")?;
+        match cipher.decrypt(nonce_ga, ct.as_ref()) {
+            Ok(plaintext) => {
+                if plaintext != b"vault-ok" {
+                    k1.zeroize();
+                    return Err("That password didn’t work.".into());
+                }
+                println!("(debug) verifier decrypted OK — password valid");
+            }
+            Err(_) => {
+                k1.zeroize();
+                return Err("That password didn’t work.".into());
+            }
+        }
+    }
 
     // Implemented: Step 2 decapsulation to recover ss (RAM-only). check recover_device_secret function above unlock_vault command
     match recover_device_secret(&db) {
@@ -1245,6 +1319,8 @@ pub fn vault_get(db: State<AppDb>, id: i64) -> Result<String, String> {
         return Err("Invalid id".into());
     }
 
+    println!("in vault_get");
+
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     let enc = crate::vault_core::db::get_entry_encrypted(&conn, id)
         .map_err(|e| e.to_string())?
@@ -1263,11 +1339,14 @@ pub fn vault_get(db: State<AppDb>, id: i64) -> Result<String, String> {
         decrypt_password(aes_key_ref, &nonce12, enc.ciphertext, &tag16)?
     };
 
+    println!("done with vault_get");
+
     Ok(plaintext)
 }
 
 #[command]
 pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
+    println!("RUST in vault_delete id={}", id);
     if id <= 0 {
         return Err("Invalid id".into());
     }
@@ -1276,6 +1355,7 @@ pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
     if n == 0 {
         Err("No entry found with that id".into())
     } else {
+        println!("RUST done with deleted entry id={}", id);
         Ok(())
     }
 }
@@ -1293,3 +1373,91 @@ pub fn get_clipboard_text() -> Result<String, String> {
     let text = clipboard.get_text().map_err(|e| e.to_string())?;
     Ok(text)
 }
+
+
+/// DEV ONLY: Insert a known-corrupted entry (same values every time).
+/// Always returns the inserted entry id.
+/// Intended to trigger AES-GCM decrypt failure in `vault_get`.
+#[cfg(debug_assertions)]
+#[command]
+pub fn debug_insert_bad_entry(db: State<AppDb>) -> Result<i64, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+
+    // Known wrong nonce + tag + ciphertext (invalid AES-GCM)
+    let nonce: [u8; 12] = [
+        0xDE, 0xAD, 0xBE, 0xEF,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let tag: [u8; 16] = [
+        0xBA, 0xAD, 0xF0, 0x0D,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let ciphertext: Vec<u8> = vec![0x00, 0x11, 0x22, 0x33];
+
+    let new = crate::vault_core::db::NewEntry {
+        label: "CorruptEntry",
+        username: "testuser",
+        notes: None,
+        nonce: &nonce,
+        ciphertext: &ciphertext,
+        tag: &tag,
+    };
+
+    let inserted = crate::vault_core::db::add_entry(&conn, new)
+        .map_err(|e| e.to_string())?;
+
+    println!("[debug] inserted corrupted entry id={} ✅", inserted.id);
+
+    Ok(inserted.id)
+}
+
+
+
+
+
+#[tauri::command]
+pub fn setup_verifier(db: State<AppDb>, password: String) -> Result<(), String> {
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, OsRng, rand_core::RngCore}};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use sha2::Sha256;
+    use pbkdf2::pbkdf2_hmac;
+
+    // Get salt_pw from DB
+    let salt_pw_b64: String = {
+        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        conn.query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get::<_, String>(0))
+            .map_err(|_| "missing salt_pw")?
+    };
+
+    // Decode salt and derive K1
+    let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode failed")?;
+    let mut k1 = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_pw, 310_000, &mut k1);
+
+    // Create verifier
+    let verifier_plain = b"vault-ok";
+    let cipher = Aes256Gcm::new_from_slice(&k1).unwrap();
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let verifier_ct = cipher.encrypt(&nonce.into(), verifier_plain.as_ref()).unwrap();
+
+    // Store verifier in meta
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('verifier_nonce', ?1)",
+        [B64.encode(&nonce)],
+    ).map_err(|_| "insert verifier_nonce failed")?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('verifier_ct', ?1)",
+        [B64.encode(&verifier_ct)],
+    ).map_err(|_| "insert verifier_ct failed")?;
+
+    println!("verifier added successfully");
+    Ok(())
+}
+

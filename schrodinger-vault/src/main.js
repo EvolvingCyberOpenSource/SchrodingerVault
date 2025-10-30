@@ -5,7 +5,8 @@ const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
 const BULLETS = "••••••••";
 
 // --- Password reveal ---
-async function showPassword(id, secretSpan, showBtn) {
+async function showPassword(id, secretSpan, showBtn, errorMsg) {
+    errorMsg.textContent = ""; 
     try {
         showBtn.disabled = true;
         const value = await invoke("vault_get", { id });
@@ -17,6 +18,7 @@ async function showPassword(id, secretSpan, showBtn) {
         }, PASS_VIS_DURATION);
     } catch (err) {
         console.log("Show failed:", err);
+        errorMsg.textContent = err;
         showBtn.disabled = false;
     }
 }
@@ -48,11 +50,13 @@ async function copyPassword(id) {
 
 // --- Delete an entry ---
 async function deleteEntry(id, row, label) {
-    const ok = confirm(`Delete "${label}"?`);
-    if (!ok) return;
+    console.log("JS in delete entry: ", id);
+    // const ok = confirm(`Delete "${label}"?`);
+    // if (!ok) return;
     try {
         await invoke("vault_delete", { id });
         row.remove();
+        console.log("JS done with delete entry: ", id);
     } catch (err) {
         console.log("Delete failed:", err);
     }
@@ -70,9 +74,10 @@ function renderRow(e) {
     row.querySelector('.entry-notes').textContent = (e.notes == null ? '' : e.notes);
 
     const secretSpan = row.querySelector('.secret');
+    const errorMsg = row.querySelector('.errorMsg'); 
     secretSpan.textContent = BULLETS;
     const showBtn = row.querySelector('.show');
-    showBtn.addEventListener('click', () => showPassword(e.id, secretSpan, showBtn));
+    showBtn.addEventListener('click', () => showPassword(e.id, secretSpan, showBtn, errorMsg));
 
     row.querySelector('.copy').addEventListener('click', () => copyPassword(e.id));
     row.querySelector('.delete').addEventListener('click', () => deleteEntry(e.id, row, e.label));

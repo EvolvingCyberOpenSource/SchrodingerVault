@@ -5,6 +5,7 @@
 mod commands;
 mod state;
 mod vault_core;
+mod error;
 
 // import rust tools and tauri
 use tauri::{self, Manager};
@@ -59,6 +60,8 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_entry_blob_info,
             commands::debug_tamper_entry,
             commands::debug_crypto_selftest,
+            commands::setup_verifier,
+            commands::debug_insert_bad_entry,
         ])
 }
 

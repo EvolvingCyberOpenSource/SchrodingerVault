@@ -298,6 +298,13 @@ button:disabled {
     overflow: hidden;
 }
 
+.errorMsg {
+    color: #e00;
+    font-size: 0.8rem;
+    margin-left: 8px;
+    display: inline;
+  }
+  
 
 /* Listed entries header row */
 
