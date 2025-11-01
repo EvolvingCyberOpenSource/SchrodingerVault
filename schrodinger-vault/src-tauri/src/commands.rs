@@ -538,7 +538,7 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
         Err(e) => {
             // Explicit, user-friendly error if SK missing or ct_kem corrupted
             k1.zeroize();
-            return Err(e);
+            return Err("Vault cannot be unlocked — device key missing or vault data corrupted.".into());
         }
     }
 }
@@ -842,6 +842,26 @@ pub fn debug_hkdf_step5_zeroize_demo(
         aes_after_b64,
     })
 }
+
+
+#[command]
+pub fn debug_delete_device_key() -> Result<bool, String> {
+    match keystore_path() {
+        Ok(sk_path) => {
+            if sk_path.exists() {
+                std::fs::remove_file(&sk_path)
+                    .map_err(|e| format!("Failed to remove device key: {e}"))?;
+                println!("(debug) Removed device key at: {}", sk_path.display());
+                Ok(true)
+            } else {
+                Err("Device key already missing".into())
+            }
+        }
+        Err(e) => Err(format!("keystore_path error: {e}")),
+    }
+}
+
+
 
 // Print/Assert zeroize demo
 #[derive(serde::Serialize)]

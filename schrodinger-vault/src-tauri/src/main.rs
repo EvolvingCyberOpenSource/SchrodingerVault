@@ -62,6 +62,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_crypto_selftest,
             commands::setup_verifier,
             commands::debug_insert_bad_entry,
+            commands::debug_delete_device_key,
         ])
 }
 
