@@ -1,5 +1,6 @@
 // bridges to call Rust commands from JavaScript
 const { invoke } = window.__TAURI__.core;
+const { ask } = window.__TAURI__.dialog;
 
 const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
 const BULLETS = "••••••••";
@@ -84,11 +85,16 @@ async function copyPassword(id) {
 
 // --- Delete an entry ---
 async function deleteEntry(id, row, label) {
-    const ok = confirm(`Delete "${label}"?`);
+    const ok = await ask(`Delete entry: "${label}"?`, {
+        title: "Tauri",
+        kind: "warning",
+    });
     if (!ok) return;
+
     try {
         await invoke("vault_delete", { id });
         row.remove();
+        console.log("JS done with deleteEntry: ", id)
     } catch (err) {
         console.log("Delete failed:", err);
     }

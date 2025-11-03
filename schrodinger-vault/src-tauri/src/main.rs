@@ -31,6 +31,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::add_person,
