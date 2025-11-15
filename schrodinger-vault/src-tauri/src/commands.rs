@@ -298,6 +298,35 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
         pk_kem_raw.len(), ct_kem_raw.len()
     );
 
+    // =======================================
+    // ML-DSA KEYPAIR (signatures for manifest)
+    // =======================================
+    use oqs::sig::{Sig, Algorithm as SigAlgorithm};
+
+    let dsa = Sig::new(SigAlgorithm::MlDsa65)
+        .map_err(|e| format!("ML-DSA init failed: {}", e))?;
+    
+    let (dsa_pk, dsa_sk) = dsa
+        .keypair()
+        .map_err(|e| format!("ML-DSA keypair failed: {}", e))?;
+    
+    let dsa_pk_b64 = B64.encode(dsa_pk.as_ref());
+    
+    // store ML-DSA public key in meta
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('dsa_pk', ?1)",
+        [&dsa_pk_b64],
+    ).map_err(|e| format!("insert dsa_pk failed: {}", e))?;
+    
+    // store ML-DSA secret key on disk next to mlkem768.sk
+    let mut dsa_sk_path = keystore_path().map_err(|e| e.to_string())?;
+    dsa_sk_path.set_file_name("ml_dsa.sk");
+    
+    write_secret_key_secure(&dsa_sk_path, dsa_sk.as_ref())
+        .map_err(|e| format!("write ML-DSA secret key failed: {}", e))?;
+    
+    println!("(debug) ML-DSA secret key stored at {}", dsa_sk_path.display());
+
     // Base64 for TEXT meta
     let pk_kem_b64 = B64.encode(&pk_kem_raw);
     let ct_kem_b64 = B64.encode(&ct_kem_raw);
@@ -322,6 +351,62 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
 
         tx.commit().map_err(|e| e.to_string())?;
     }
+
+     // --- Manifest creation for tamper detection ---
+{
+    use sha2::{Digest, Sha256};
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    println!("(debug) creating vault manifest for integrity check");
+
+    // Re-acquire a read handle
+    let mut manifest_input = String::new();
+    for key in ["salt_pw", "salt_kdf", "pk_kem", "ct_kem", "verifier_nonce", "verifier_ct"] {
+        let value: String = conn.query_row(
+            "SELECT value FROM meta WHERE key=?1", [key],
+            |r| r.get::<_, String>(0)
+        ).unwrap_or_default();
+        manifest_input.push_str(&value);
+    }
+
+    // Compute hash
+    let manifest_hash = Sha256::digest(manifest_input.as_bytes());
+    let manifest_b64 = B64.encode(manifest_hash);
+
+    // -------- REAL ML-DSA SIGNATURE --------
+
+    let mut dsa_sk_path = keystore_path().map_err(|e| e.to_string())?;
+    dsa_sk_path.set_file_name("ml_dsa.sk");
+
+    let dsa_sk_bytes = std::fs::read(&dsa_sk_path)
+        .map_err(|e| format!("read ml_dsa.sk failed: {e}"))?;
+
+    let dsa = Sig::new(SigAlgorithm::MlDsa65)
+        .map_err(|e| format!("ML-DSA init failed: {}", e))?;
+
+    let dsa_sk_ref = dsa
+        .secret_key_from_bytes(&dsa_sk_bytes)
+        .ok_or("Invalid ML-DSA secret key")?;
+
+    let sig = dsa
+        .sign(manifest_hash.as_ref(), dsa_sk_ref)
+        .map_err(|e| format!("ML-DSA sign failed: {}", e))?;
+
+    let signature_b64 = B64.encode(sig.as_ref());
+
+    // Store both into meta
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_hash', ?1)",
+        [&manifest_b64],
+    ).map_err(|e| format!("insert manifest_hash failed: {e}"))?;
+    
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_sig', ?1)",
+        [&signature_b64],
+    ).map_err(|e| format!("insert manifest_sig failed: {e}"))?;
+
+    println!("(debug) vault manifest stored successfully");
+}
 
     println!("(debug) salts + kdf + kem public material stored; SK on disk.");
     println!("== create_vault done ==");
@@ -493,6 +578,95 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
             }
         }
     }
+
+        // --- Manifest verification for tamper detection ---
+        {
+            use sha2::{Digest, Sha256};
+            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+            use oqs::sig::{Sig, Algorithm as SigAlgorithm};
+    
+            println!("(debug) verifying vault manifest integrity (ML-DSA)");
+    
+            let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    
+            // 1) Rebuild manifest input exactly like in create_vault
+            let mut manifest_input = String::new();
+            for key in ["salt_pw", "salt_kdf", "pk_kem", "ct_kem", "verifier_nonce", "verifier_ct"] {
+                let value: String = conn.query_row(
+                    "SELECT value FROM meta WHERE key=?1",
+                    [key],
+                    |r| r.get::<_, String>(0),
+                ).unwrap_or_default();
+                manifest_input.push_str(&value);
+            }
+    
+            // 2) Compute fresh SHA-256 hash and base64-encode it
+            let manifest_hash = Sha256::digest(manifest_input.as_bytes());
+            let manifest_b64 = B64.encode(manifest_hash);
+    
+            // 3) Load stored manifest hash + signature + ML-DSA public key
+            let stored_hash_b64: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='manifest_hash'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "missing manifest_hash")?;
+    
+            let stored_sig_b64: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='manifest_sig'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "missing manifest_sig")?;
+    
+            let dsa_pk_b64: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key='dsa_pk'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|_| "missing dsa_pk")?;
+    
+            // 4) First check: hash equality (simple tamper check)
+            if manifest_b64 != stored_hash_b64 {
+                println!("(warn) manifest hash mismatch — possible tampering detected");
+                k1.zeroize(); 
+                return Err("This vault has been modified outside of Schrödinger Vault. Unlock blocked.".into());
+            }
+    
+            // 5) Decode signature + public key from base64
+            let sig_bytes = B64
+                .decode(stored_sig_b64.as_bytes())
+                .map_err(|_| "manifest_sig decode failed")?;
+    
+            let pk_bytes = B64
+                .decode(dsa_pk_b64.as_bytes())
+                .map_err(|_| "dsa_pk decode failed")?;
+    
+            // 6) Initialize ML-DSA verifier
+            let dsa = Sig::new(SigAlgorithm::MlDsa65)
+                .map_err(|e| format!("ML-DSA init failed: {}", e))?;
+    
+            let pk_ref = dsa
+                .public_key_from_bytes(&pk_bytes)
+                .ok_or("Invalid ML-DSA public key")?;
+    
+            let sig_ref = dsa
+                .signature_from_bytes(&sig_bytes)
+                .ok_or("Invalid ML-DSA signature")?;
+    
+            // manifest_hash is raw bytes; we signed exactly these bytes in create_vault
+            if let Err(e) = dsa.verify(manifest_hash.as_ref(), sig_ref, pk_ref) {
+                println!("(warn) ML-DSA signature verification failed: {e}");
+                k1.zeroize(); 
+                return Err("This vault has been modified outside of Schrödinger Vault. Unlock blocked.".into());
+            }
+    
+            println!("(debug) manifest verification (hash + ML-DSA) passed");
+        }
+
 
     // Implemented: Step 2 decapsulation to recover ss (RAM-only). check recover_device_secret function above unlock_vault command
     match recover_device_secret(&db) {
@@ -1435,6 +1609,50 @@ pub fn debug_insert_bad_entry(db: State<AppDb>) -> Result<i64, String> {
 
     Ok(inserted.id)
 }
+
+// debug vault corruption
+/// Debug helper: intentionally corrupt one of the manifest-dependent fields
+/// to trigger "tampered vault" detection during next unlock.
+/// This simulates external modification of the vault database.
+#[command]
+pub fn debug_corrupt_manifest(db: State<AppDb>) -> Result<bool, String> {
+    use rand::Rng;
+
+    let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+
+    // picking a field that is in the manifest hash
+    // salt_kdf is safe to corrupt (will not break DB structure)
+    let key_to_corrupt = "salt_kdf";
+
+    // read original value
+    let original_value: String = conn
+        .query_row("SELECT value FROM meta WHERE key=?1", [key_to_corrupt], |r| r.get(0))
+        .map_err(|_| format!("missing meta key: {key_to_corrupt}"))?;
+
+    // mutate a single random character to simulate tampering
+    let mut chars: Vec<char> = original_value.chars().collect();
+    if !chars.is_empty() {
+        let mut rng = rand::thread_rng();
+        let i = rng.gen_range(0..chars.len());
+        chars[i] = if chars[i] == 'A' { 'B' } else { 'A' }; // flip a char
+    }
+    let corrupted: String = chars.into_iter().collect();
+
+    // update the field in DB
+    conn.execute(
+        "UPDATE meta SET value=?1 WHERE key=?2",
+        (&corrupted, &key_to_corrupt),
+    )
+    .map_err(|e| format!("failed to update meta: {e}"))?;
+
+    println!(
+        "(debug) intentionally corrupted '{}' field — manifest mismatch expected next unlock",
+        key_to_corrupt
+    );
+
+    Ok(true)
+}
+
 
 
 

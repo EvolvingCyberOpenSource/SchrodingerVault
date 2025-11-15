@@ -30,30 +30,44 @@ form.addEventListener("submit", async (e) => {
     }
 
 
-    // === Ask Rust to unlock the vault ===
+    // try unlocking the vault
     await invoke("unlock_vault", { password: pw });
 
-    // === Redirect to entries page ===
+    // redirect to entries page if no failures
     failedAttempts = 0;
     lockUntil = 0;
     window.location.replace("index.html");
   } catch (err) {
     console.error("Unlock failed:", err);
 
-    const msgText = typeof err === "string" ? err : err?.message || "";
+    const msgText =
+      typeof err === "string"
+        ? err
+        : (err?.message || "");
+
+    // 1. tampered vault (manifest corrupted)
+    if (msgText.includes("modified outside")) {
+        msg.textContent =
+            "This vault has been modified outside of Schrödinger Vault. Unlock blocked.";
+        unlockBtn.disabled = true; 
+        return; 
+    }
+
+    // 2. device key missing ot ct_kem corrupted 
     if (msgText.includes("device key") || msgText.includes("vault data corrupted")) {
-      msg.textContent = "Vault cannot be unlocked — device key missing or vault data corrupted.";
-      unlockBtn.disabled = true;  // no point retrying password is correct but vault broken
-      return;
-  }
-    // Increment failure count
+        msg.textContent =
+            "Vault cannot be unlocked — device key missing or vault data corrupted.";
+        unlockBtn.disabled = true;
+        return;
+    }
+
+ 
+    // 3. wrong password. user can try again after a delay
     failedAttempts++;
 
-    // Compute backoff delay 
     const delay = Math.min(BASE_DELAY * (2 ** (failedAttempts - 1)), MAX_DELAY);
     lockUntil = Date.now() + delay;
 
-    // Show user facing message
     const baseMsg =
       typeof err === "string" && err.trim()
         ? err
@@ -61,17 +75,19 @@ form.addEventListener("submit", async (e) => {
 
     msg.textContent = `${baseMsg} (wait ${Math.round(delay / 1000)}s)`;
 
-    // Disable unlock button during the delay
+    // Disable unlock button during the wait
     unlockBtn.disabled = true;
     setTimeout(() => {
         unlockBtn.disabled = false;
     }, delay);
 
-    // lockout after too many fails
+    //
+    // 4. --- Hard lockout after N failures ---
+    //
     if (failedAttempts >= MAX_FAILS) {
-        msg.textContent = "Too many failed attempts — restart the app to try again.";
+        msg.textContent =
+            "Too many failed attempts — restart the app to try again.";
         unlockBtn.disabled = true;
-        console.log("Vault locked due to excessive failures.");
     }
   }
 });
