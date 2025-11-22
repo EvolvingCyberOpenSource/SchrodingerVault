@@ -64,6 +64,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_insert_bad_entry,
             commands::debug_delete_device_key,
             commands::debug_corrupt_manifest,
+            commands::factory_reset_vault,
         ])
 }
 

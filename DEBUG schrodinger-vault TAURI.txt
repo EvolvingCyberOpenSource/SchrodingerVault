@@ -97,6 +97,16 @@ check encryption/decryption:
 await window.__TAURI__.core.invoke('debug_crypto_selftest', { pt: 'hello123' });
 
 
+EROR HANDLING TESTS:
+await window.__TAURI__.core.invoke('debug_insert_bad_entry') // inserts corrupted key into database, user should get error message when trying to show
+
+await window.__TAURI__.core.invoke('debug_corrupt_manifest') // corrupts manifest in db, user should not be able to log in and given the error message
+
+await window.__TAURI__.core.invoke('debug_delete_device_key') // deletes device key off computer,  user should not be able to log in and given the error message
+
+
+
+
 
 
 

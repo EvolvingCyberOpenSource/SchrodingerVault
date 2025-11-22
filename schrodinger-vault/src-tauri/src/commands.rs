@@ -801,6 +801,62 @@ fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
     ))
 }
 
+
+// function is meant to be tirggered on a vault reset and then frontend should send user back to create vault screen
+#[command]
+pub fn factory_reset_vault(app: AppHandle, db: State<AppDb>) -> Result<bool, String> {
+
+    // delete ML-KEM key
+    let sk_path = keystore_path().map_err(|e| e.to_string())?;
+    remove_file_if_exists(&sk_path).ok();
+
+    // delete ML-DSA key
+    let mut dsa_path = keystore_path().map_err(|e| e.to_string())?;
+    dsa_path.set_file_name("ml_dsa.sk");
+    remove_file_if_exists(&dsa_path).ok();
+
+    // delete meta + entries 
+    {
+        let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+        tx.execute(
+            "DELETE FROM meta WHERE key IN (
+                'salt_pw','salt_kdf','kdf','kdf_params',
+                'pk_kem','ct_kem','kem_alg','alg',
+                'manifest_hash','manifest_sig',
+                'verifier_nonce','verifier_ct',
+                'dsa_pk'
+            )",
+            [],
+        ).map_err(|e| e.to_string())?;
+
+        tx.execute("DELETE FROM entries", [])
+            .map_err(|e| e.to_string())?;
+
+        tx.commit().map_err(|e| e.to_string())?;
+    }
+
+    // release file lock + recreate DB
+    {
+        let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let tmp = rusqlite::Connection::open_in_memory().map_err(|e| e.to_string())?;
+        let _old = std::mem::replace(&mut *guard, tmp);
+    }
+
+    let p = crate::vault_core::db::db_path(&app);
+    let _ = std::fs::remove_file(&p);
+
+    let new_conn = crate::vault_core::db::open_and_init(&app).map_err(|e| e.to_string())?;
+    {
+        let mut guard = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let _old = std::mem::replace(&mut *guard, new_conn);
+    }
+
+    println!("(reset) factory reset complete");
+    Ok(true)
+}
+
 // =========================
 // Debug helpers
 // =========================
