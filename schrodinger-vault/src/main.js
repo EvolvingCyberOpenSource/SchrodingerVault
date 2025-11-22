@@ -39,12 +39,26 @@ function showToast(message, duration = 3000) {
 
 }
 
+// --- Copy password helper for windows ---
+async function copyPasswordNoHistory(text) {
+    // Try windows no-history copy first
+    try {
+        await window.__TAURI__.core.invoke("copy_to_clipboard_no_history", { text });
+        return;
+    } catch (e) {
+        // If not on windows, fall back
+        // console.debug("no-history copy unavailable, using standard copy:", e);
+    }
+    await window.__TAURI__.core.invoke("copy_to_clipboard", { text });
+}
+
 // --- Copy password ---
 async function copyPassword(id) {
     try {
         const value = await invoke("vault_get", { id });
         try {
-            await invoke("copy_to_clipboard", { text: value });
+            // await invoke("copy_to_clipboard", { text: value }); // old way
+            await copyPasswordNoHistory(value);
             showToast("Copied");
             console.log("copy to clipboard successful");
         } catch (e) {
@@ -67,7 +81,8 @@ async function copyPassword(id) {
             try {
                 const current_clipboard = await invoke("get_clipboard_text");
                 if (current_clipboard === value) {
-                    await invoke("copy_to_clipboard", { text: "" });
+                    // await invoke("copy_to_clipboard", { text: "" }); // old way
+                    await copyPasswordNoHistory("");
                     showToast("Clipboard cleared");
                 }
             } catch (err) {

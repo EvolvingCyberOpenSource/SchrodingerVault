@@ -44,6 +44,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::vault_get,
             commands::vault_delete,
             commands::copy_to_clipboard,
+            commands::copy_to_clipboard_no_history,
             commands::get_clipboard_text,
             commands::debug_kem_status,
             commands::debug_dump_meta,
