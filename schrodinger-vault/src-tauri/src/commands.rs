@@ -792,15 +792,6 @@ pub fn lock_vault() {
     println!("clearing clipboard");
 }
 
-#[command]
-pub fn lock_vault() {
-    println!("Locking vault");
-    zeroize_aes_key();
-    println!("zeroized aes key");
-    copy_to_clipboard("");
-    println!("clearing clipboard");
-}
-
 /// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,
 /// writes SK to keystore with tight perms, and returns (pk_raw, ct_raw, ss).
 fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
