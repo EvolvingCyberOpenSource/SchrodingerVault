@@ -1,12 +1,17 @@
 // bridges to call Rust commands from JavaScript
 const { invoke } = window.__TAURI__.core;
+const { ask } = window.__TAURI__.dialog;
 
 const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
 const BULLETS = "••••••••";
 
+// single clipboard timer and owner token
+let clipboardClearTimer = null;
+let clipboardOwnerToken = 0;
+
 // --- Password reveal ---
 async function showPassword(id, secretSpan, showBtn, errorMsg) {
-    errorMsg.textContent = ""; 
+    errorMsg.textContent = "";
     try {
         showBtn.disabled = true;
         const value = await invoke("vault_get", { id });
@@ -23,24 +28,71 @@ async function showPassword(id, secretSpan, showBtn, errorMsg) {
     }
 }
 
+// -- Toast notification --
+function showToast(message, duration = 3000) {
+    const toast = document.getElementById("toast");
+    toast.textContent = message;
+    toast.classList.add("show");
+
+    clearTimeout(showToast._timer);
+    showToast._timer = setTimeout(() => {
+        toast.classList.remove("show");
+    }, duration);
+
+}
+
+// --- Copy password helper for windows ---
+async function copyPasswordNoHistory(text) {
+    // Try windows no-history copy first
+    try {
+        await window.__TAURI__.core.invoke("copy_to_clipboard_no_history", { text });
+        return;
+    } catch (e) {
+        // If not on windows, fall back
+        // console.debug("no-history copy unavailable, using standard copy:", e);
+    }
+    await window.__TAURI__.core.invoke("copy_to_clipboard", { text });
+}
+
 // --- Copy password ---
 async function copyPassword(id) {
     try {
         const value = await invoke("vault_get", { id });
         try {
-            await invoke("copy_to_clipboard", { text: value });
+            // await invoke("copy_to_clipboard", { text: value }); // old way
+            await copyPasswordNoHistory(value);
+            showToast("Copied");
             console.log("copy to clipboard successful");
         } catch (e) {
             console.error('Failed to copy:', e);
+            return;
         }
-        setTimeout(async() => {
+        // 
+        const myToken = ++clipboardOwnerToken;
+
+        // cancel any old timers for existing copy action
+        if (clipboardClearTimer) {
+            clearTimeout(clipboardClearTimer);
+            clipboardClearTimer = null;
+        }
+        // start countdown for latest copy
+        clipboardClearTimer = setTimeout(async() => {
+            // verify still latest copy 
+            if (myToken !== clipboardOwnerToken) return;
+
             try {
                 const current_clipboard = await invoke("get_clipboard_text");
                 if (current_clipboard === value) {
-                    await invoke("copy_to_clipboard", { text: "" });
+                    // await invoke("copy_to_clipboard", { text: "" }); // old way
+                    await copyPasswordNoHistory("");
+                    showToast("Clipboard cleared");
                 }
             } catch (err) {
-                console.log("Clipboard read error: ", err);
+                console.log("Clipboard read/clear error:", err);
+            } finally {
+                if (myToken === clipboardOwnerToken) {
+                    clipboardClearTimer = null;
+                }
             }
         }, PASS_VIS_DURATION);
     } catch (err) {
@@ -50,13 +102,16 @@ async function copyPassword(id) {
 
 // --- Delete an entry ---
 async function deleteEntry(id, row, label) {
-    console.log("JS in delete entry: ", id);
-    // const ok = confirm(`Delete "${label}"?`);
-    // if (!ok) return;
+    const ok = await ask(`Delete entry: "${label}"?`, {
+        title: "Tauri",
+        kind: "warning",
+    });
+    if (!ok) return;
+
     try {
         await invoke("vault_delete", { id });
         row.remove();
-        console.log("JS done with delete entry: ", id);
+        console.log("JS done with deleteEntry: ", id)
     } catch (err) {
         console.log("Delete failed:", err);
     }
@@ -74,7 +129,7 @@ function renderRow(e) {
     row.querySelector('.entry-notes').textContent = (e.notes == null ? '' : e.notes);
 
     const secretSpan = row.querySelector('.secret');
-    const errorMsg = row.querySelector('.errorMsg'); 
+    const errorMsg = row.querySelector('.errorMsg');
     secretSpan.textContent = BULLETS;
     const showBtn = row.querySelector('.show');
     showBtn.addEventListener('click', () => showPassword(e.id, secretSpan, showBtn, errorMsg));
@@ -123,6 +178,8 @@ async function addEntry() {
     const label = labelEl.value;
     const username = usernameEl.value;
     const password = passwordEl.value;
+    // clear sensitive DOM value immediately
+    passwordEl.value = "";
     const notesRaw = notesEl.value;
     const notes = notesRaw.trim().length ? notesRaw : null;
 
@@ -131,13 +188,15 @@ async function addEntry() {
         // clear inputs after add
         labelEl.value = "";
         usernameEl.value = "";
-        passwordEl.value = "";
         notesEl.value = "";
 
         // reload list with new entry
         await loadEntries();
     } catch (err) {
         console.log("Error adding entry: ", err);
+    } finally {
+        // ensure sensitive var is cleared
+        password = null;
     }
 }
 

@@ -22,6 +22,26 @@ use secrecy::{SecretString, ExposeSecret};
 use oqs::kem::Algorithm;
 use arboard::Clipboard;
 
+#[cfg(target_os = "windows")]
+use windows::{
+    core::w,
+    Win32::{
+        Foundation::{HANDLE, HWND, HGLOBAL},
+        System::{
+            DataExchange::{
+                CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
+                SetClipboardData,
+            },
+            Memory::{
+                GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
+            },
+        },
+    },
+};
+
+#[cfg(target_os = "windows")]
+const CF_UNICODETEXT: u32 = 13;
+
 use aes_gcm::{Aes256Gcm, aead::{AeadInPlace, KeyInit, generic_array::GenericArray}, Nonce};
 use crate::error::{ErrorCode, VaultError}; // enums and structs for error handling
 
@@ -763,6 +783,24 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
     }
 }
 
+#[command]
+pub fn lock_vault() {
+    println!("Locking vault");
+    zeroize_aes_key();
+    println!("zeroized aes key");
+    copy_to_clipboard("");
+    println!("clearing clipboard");
+}
+
+#[command]
+pub fn lock_vault() {
+    println!("Locking vault");
+    zeroize_aes_key();
+    println!("zeroized aes key");
+    copy_to_clipboard("");
+    println!("clearing clipboard");
+}
+
 /// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,
 /// writes SK to keystore with tight perms, and returns (pk_raw, ct_raw, ss).
 fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
@@ -1343,7 +1381,6 @@ pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
     Ok(out)
 }
 
-#[cfg(debug_assertions)]
 #[command]
 pub fn debug_aes_key_exists() -> bool {
     VAULT_AES_KEY
@@ -1352,7 +1389,6 @@ pub fn debug_aes_key_exists() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(debug_assertions)]
 #[command]
 pub fn debug_zeroize_aes_key() -> Result<(), String> {
     let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
@@ -1658,8 +1694,114 @@ pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
     }
 }
 
+// For windows, prevents password from staying in clipboard history
+#[tauri::command]
+#[cfg(target_os = "windows")]
+pub fn copy_to_clipboard_no_history(text: &str) -> Result<(), String> {
+    unsafe {
+        OpenClipboard(None).map_err(|e| format!("OpenClipboard failed: {e}"))?;
+        // makes sure clipboard will be closed when _guard goes out of scope
+        struct Close;
+        impl Drop for Close {
+            fn drop(&mut self) { unsafe { let _ = CloseClipboard(); } }
+        }
+        let _guard = Close;
+        // clear existing clipboard
+        EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
+        // converts text to utf-16 windows format
+        let mut utf16: Vec<u16> = text.encode_utf16().collect();
+        utf16.push(0);
+        let byte_len = utf16.len() * 2;
+        // allocate memory for the text
+        let h_text: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, byte_len)
+            .map_err(|e| format!("GlobalAlloc(text) failed: {e}"))?;
+        // copy text into the memory
+        let p = GlobalLock(h_text);
+        if p.is_null() {
+            return Err("GlobalLock(text) failed".into());
+        }
+        std::ptr::copy_nonoverlapping(
+            utf16.as_ptr() as *const u8,
+            p as *mut u8,
+            byte_len,
+        );
+        GlobalUnlock(h_text);
+        // puts text in clipboard
+        if let Err(e) = SetClipboardData(CF_UNICODETEXT, HANDLE(h_text.0)) {
+            return Err(format!("SetClipboardData(CF_UNICODETEXT) failed: {e}"));
+        }
+        // prevent windows from storing in clipboard history
+        let fmt_exclude = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+        if fmt_exclude == 0 {
+            return Err("RegisterClipboardFormatW(exclude) failed".into());
+        }
+        // add "exclude" marker which tells windows to not store in history
+        let h_flag: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 4)
+            .map_err(|e| format!("GlobalAlloc(flag) failed: {e}"))?;
+
+        if let Err(e) = SetClipboardData(fmt_exclude, HANDLE(h_flag.0)) {
+            return Err(format!("SetClipboardData(exclude) failed: {e}"));
+        }
+
+        Ok(())
+    }
+}
+
+// For windows, prevents password from staying in clipboard history
+#[tauri::command]
+#[cfg(target_os = "windows")]
+pub fn copy_to_clipboard_no_history(text: &str) -> Result<(), String> {
+    unsafe {
+        OpenClipboard(None).map_err(|e| format!("OpenClipboard failed: {e}"))?;
+        // makes sure clipboard will be closed when _guard goes out of scope
+        struct Close;
+        impl Drop for Close {
+            fn drop(&mut self) { unsafe { let _ = CloseClipboard(); } }
+        }
+        let _guard = Close;
+        // clear existing clipboard
+        EmptyClipboard().map_err(|e| format!("EmptyClipboard failed: {e}"))?;
+        // converts text to utf-16 windows format
+        let mut utf16: Vec<u16> = text.encode_utf16().collect();
+        utf16.push(0);
+        let byte_len = utf16.len() * 2;
+        // allocate memory for the text
+        let h_text: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, byte_len)
+            .map_err(|e| format!("GlobalAlloc(text) failed: {e}"))?;
+        // copy text into the memory
+        let p = GlobalLock(h_text);
+        if p.is_null() {
+            return Err("GlobalLock(text) failed".into());
+        }
+        std::ptr::copy_nonoverlapping(
+            utf16.as_ptr() as *const u8,
+            p as *mut u8,
+            byte_len,
+        );
+        GlobalUnlock(h_text);
+        // puts text in clipboard
+        if let Err(e) = SetClipboardData(CF_UNICODETEXT, HANDLE(h_text.0)) {
+            return Err(format!("SetClipboardData(CF_UNICODETEXT) failed: {e}"));
+        }
+        // prevent windows from storing in clipboard history
+        let fmt_exclude = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+        if fmt_exclude == 0 {
+            return Err("RegisterClipboardFormatW(exclude) failed".into());
+        }
+        // add "exclude" marker which tells windows to not store in history
+        let h_flag: HGLOBAL = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 4)
+            .map_err(|e| format!("GlobalAlloc(flag) failed: {e}"))?;
+
+        if let Err(e) = SetClipboardData(fmt_exclude, HANDLE(h_flag.0)) {
+            return Err(format!("SetClipboardData(exclude) failed: {e}"));
+        }
+
+        Ok(())
+    }
+}
+
 #[command]
-pub fn copy_to_clipboard(text: String) -> Result<(), String> {
+pub fn copy_to_clipboard(text: &str) -> Result<(), String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
     clipboard.set_text(text).map_err(|e| e.to_string())?;
     Ok(())

@@ -7,6 +7,10 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[profile.release]
+debug = true
+opt-level = 3
+lto = false
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -29,4 +33,10 @@ oqs = "0.11.0"
 dirs = "6.0.0"
 secrecy = "0.10.3"
 arboard = "3.4.1"
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+] }
 aead = "0.5"
+tauri-plugin-dialog = "2.4.2"

@@ -83,6 +83,7 @@ body {
     max-width: 400px;
     margin: auto;
     background: var(--surface);
+    border: 1px solid var(--border);
     border-radius: 12px;
     padding: 2em 2em 2.5em;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
@@ -107,7 +108,7 @@ h1 {
 h2 {
     font-size: 1.4rem;
     font-weight: 700;
-    color: var(--secondary);
+    color: var(--text-2);
 }
 
 h3 {
@@ -151,8 +152,10 @@ p {
 }
 
 textarea {
-    min-height: 100px;
-    resize: vertical;
+    height: 44px;
+    resize: none;
+    overflow-y: auto;
+    scrollbar-width: none;
 }
 
 :is(input, textarea):hover {
@@ -226,6 +229,12 @@ button:disabled {
     animation: fadeIn 0.8s ease-out both;
 }
 
+@media (prefers-color-scheme: dark) {
+    .logo {
+        filter: drop-shadow(0 0 5px rgba(0, 0, 0, 0.15));
+    }
+}
+
 @keyframes fadeIn {
     from {
         opacity: 0;
@@ -235,6 +244,29 @@ button:disabled {
         opacity: 1;
         transform: translateY(0);
     }
+}
+
+
+/* === Toast === */
+
+#toast {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--accent);
+    color: var(--bg);
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    opacity: 0;
+    transition: opacity .2s ease;
+    pointer-events: none;
+    z-index: 1000;
+}
+
+#toast.show {
+    opacity: 1;
 }
 
 
@@ -268,6 +300,9 @@ button:disabled {
     border-radius: 12px;
     padding: 16px;
     box-shadow: var(--shadow-1);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
 }
 
 
@@ -280,10 +315,12 @@ button:disabled {
     gap: 12px;
     align-items: start;
     margin-bottom: 12px;
+    width: 100%;
+    margin-bottom: 12px;
 }
 
-#page-home .form-grid textarea {
-    min-height: 44px;
+#page-home .add-form .btn-accent {
+    width: auto;
 }
 
 
@@ -296,6 +333,9 @@ button:disabled {
     background: var(--surface);
     box-shadow: var(--shadow-1);
     overflow: hidden;
+    display: grid;
+    grid-template-columns: var(--cols);
+    grid-auto-rows: auto;
 }
 
 .errorMsg {
@@ -309,8 +349,9 @@ button:disabled {
 /* Listed entries header row */
 
 #page-home .entries-header {
+    grid-column: 1 / -1;
     display: grid;
-    grid-template-columns: var(--cols);
+    grid-template-columns: subgrid;
     gap: 12px;
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
@@ -323,13 +364,13 @@ button:disabled {
 /* Rows */
 
 #page-home .entry-list {
-    display: flex;
-    flex-direction: column;
+    display: contents;
 }
 
 #page-home .entry-row {
+    grid-column: 1 / -1;
     display: grid;
-    grid-template-columns: var(--cols);
+    grid-template-columns: subgrid;
     gap: 12px;
     align-items: center;
     padding: 12px 16px;

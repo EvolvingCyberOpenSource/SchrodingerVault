@@ -32,6 +32,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
             commands::add_person,
@@ -44,6 +45,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::vault_get,
             commands::vault_delete,
             commands::copy_to_clipboard,
+            commands::copy_to_clipboard_no_history,
             commands::get_clipboard_text,
             commands::debug_kem_status,
             commands::debug_dump_meta,
@@ -73,8 +75,18 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
 pub fn run() {
     // calls build_app function above to build the application then runs it
     build_app()
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|_app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                println!("App exit requested — cleaning up...");
+                commands::lock_vault();
+            }
+            tauri::RunEvent::Exit => {
+                println!("App exited.");
+            }
+            _ => {}
+        });
 }
 
 // entry point, calls run right above
