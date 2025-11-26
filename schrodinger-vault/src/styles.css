@@ -292,6 +292,19 @@ button:disabled {
 }
 
 
+/* Lock button */
+.top-right-controls {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+}
+
+.top-right-controls button {
+  padding: 8px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
 /* Add-entry form */
 
 #page-home .add-form {

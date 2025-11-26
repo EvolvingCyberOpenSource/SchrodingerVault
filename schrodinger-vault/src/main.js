@@ -9,6 +9,27 @@ const BULLETS = "••••••••";
 let clipboardClearTimer = null;
 let clipboardOwnerToken = 0;
 
+// Idle timeout auto-lock timer
+const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 mins
+let idleTimer = null;
+
+function resetIdleTimer() {
+    if (idleTimer) clearTimeout(idleTimer);
+
+    idleTimer = setTimeout(() => {
+        console.log("User idle for 5 minutes. Auto-locking...");
+        lockVault();
+    }, IDLE_TIMEOUT);
+}
+
+// Register activity events to reset timer
+function registerIdleListeners() {
+    const events = ["mousemove", "keydown", "click", "scroll", "touchstart"];
+    events.forEach(ev => {
+        document.addEventListener(ev, resetIdleTimer, { passive: true });
+    });
+}
+
 // --- Password reveal ---
 async function showPassword(id, secretSpan, showBtn, errorMsg) {
     errorMsg.textContent = "";
@@ -117,6 +138,21 @@ async function deleteEntry(id, row, label) {
     }
 }
 
+// --- Lock Vault ---
+async function lockVault() {
+    try {
+        // Call the Rust command
+        await invoke("lock_vault");
+
+        // Redirect to unlock page
+        window.location.replace("unlock.html");
+    } catch (err) {
+        console.error("Error locking vault:", err);
+        showToast("Failed to lock vault");
+    }
+}
+
+
 // --- Make entry row ---
 function renderRow(e) {
     const tpl = document.getElementById('entry-row-tpl');
@@ -203,6 +239,15 @@ async function addEntry() {
 
 window.addEventListener("DOMContentLoaded", async(e) => {
     e.preventDefault();
+    const lockBtn = document.getElementById("lock-vault-btn");
+    if (lockBtn) {
+        lockBtn.addEventListener("click", lockVault);
+    }
+
+    // start idle auto-locking
+    registerIdleListeners();
+    resetIdleTimer();
+
     try {
         // 1) Is vault initialized? If not, go create one.
         const s = await invoke("debug_kem_status");

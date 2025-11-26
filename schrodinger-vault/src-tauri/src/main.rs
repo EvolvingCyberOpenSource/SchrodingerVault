@@ -40,11 +40,13 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::user_exists,
             commands::create_vault,
             commands::unlock_vault,
+            commands::lock_vault,
             commands::vault_list,
             commands::vault_add,
             commands::vault_get,
             commands::vault_delete,
             commands::copy_to_clipboard,
+            #[cfg(target_os = "windows")]
             commands::copy_to_clipboard_no_history,
             commands::get_clipboard_text,
             commands::debug_kem_status,
