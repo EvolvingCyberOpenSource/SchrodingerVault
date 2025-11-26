@@ -785,11 +785,9 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
 
 #[command]
 pub fn lock_vault() {
-    println!("Locking vault");
+    println!("Locking vault...");
     zeroize_aes_key();
-    println!("zeroized aes key");
     copy_to_clipboard("");
-    println!("clearing clipboard");
 }
 
 /// Generates ML-KEM-768 keypair, encapsulates, self-checks decapsulation,

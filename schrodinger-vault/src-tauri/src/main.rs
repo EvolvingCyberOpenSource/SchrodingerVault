@@ -10,6 +10,21 @@ mod error;
 // import rust tools and tauri
 use tauri::{self, Manager};
 
+// import panic for locking the vault on crash
+use std::panic;
+
+// import ctrlc for locking vault on command line termination
+use ctrlc;
+
+fn install_panic_hook() {
+    panic::set_hook(Box::new(|info| {
+        eprintln!("Application panicked: {info}");
+        commands::lock_vault();
+        let default_hook = panic::take_hook();
+        default_hook(info);
+    }));
+}
+
 /// Builds the Tauri app and sets everything up.
 ///
 /// This function creates the main Tauri application builder.  
@@ -75,6 +90,17 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
 /// Launches the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+
+    // installing panic hook
+    install_panic_hook();
+    
+    // call lock_vault on ctrl+c from command line
+    ctrlc::set_handler(|| {
+        println!("Received termination signal — locking vault...");
+        commands::lock_vault();
+    })
+    .expect("Error setting Ctrl-C handler");
+
     // calls build_app function above to build the application then runs it
     build_app()
         .build(tauri::generate_context!())
@@ -85,7 +111,14 @@ pub fn run() {
                 commands::lock_vault();
             }
             tauri::RunEvent::Exit => {
+                commands::lock_vault();
                 println!("App exited.");
+            }
+            tauri::RunEvent::WindowEvent { event, .. } => {
+                if let tauri::WindowEvent::Destroyed = event {
+                    println!("Window destroyed — locking vault...");
+                    commands::lock_vault();
+                }
             }
             _ => {}
         });
