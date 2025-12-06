@@ -119,7 +119,10 @@ fn get_aes_key_ref<'a>(
 // Wipe currently installed AES key (dropping Zeroizing wipes memory) #new
 fn zeroize_aes_key() -> Result<(), &'static str> {
     let mut guard = VAULT_AES_KEY.write().map_err(|_| "lock poisoned")?;
-    let _old = guard.take(); // drop → Zeroizing overwrites bytes
+    if let Some(ref mut key) = *guard {
+        key.zeroize(); // zero memory
+    }
+    *guard = None; // also remove key
     Ok(())
 }
 
