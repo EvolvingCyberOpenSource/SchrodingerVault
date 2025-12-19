@@ -34,10 +34,6 @@ document.querySelector("#passwordForm").addEventListener("submit", async (e) => 
   const password = document.querySelector("#masterPassword").value;
   const confirm_Password = document.querySelector("#confirmPassword").value;
 
-  // validate password (optional right now)
-  // const validated = validatePassword(password, confirmPassword);
-  // if (!validated) return;
-
   console.log("password entered: ", password);
 
   try {
