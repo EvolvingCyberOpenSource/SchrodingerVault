@@ -1,0 +1,12 @@
+# Global owner (fallback)
+* @EvolvingCyber
+
+# Cryptography & vault core logic (high-risk)
+schrodinger-vault/src-tauri/src/vault_core/ @EvolvingCyber
+
+# Backend commands, state, and error handling
+schrodinger-vault/src-tauri/src/ @EvolvingCyber
+
+# Frontend UI and assets
+schrodinger-vault/src/ @EvolvingCyber
+
