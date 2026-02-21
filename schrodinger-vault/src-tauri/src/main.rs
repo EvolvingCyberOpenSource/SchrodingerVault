@@ -3,6 +3,7 @@
 
 // import rust files and folders
 mod commands;
+mod debug;
 mod state;
 mod vault_core;
 mod error;
@@ -64,26 +65,26 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             #[cfg(target_os = "windows")]
             commands::copy_to_clipboard_no_history,
             commands::get_clipboard_text,
-            commands::debug_kem_status,
-            commands::debug_dump_meta,
-            commands::debug_reset_vault_soft,
-            commands::debug_reset_vault_hard,
-            commands::debug_check_no_aes_in_meta,
-            commands::debug_step5_zeroize_print,
-            commands::debug_db_path,
-            commands::debug_vault_key_status,
-            commands::debug_list_schema,
-            commands::debug_decapsulate_status,
-            commands::debug_aes_key_exists,
-            commands::debug_zeroize_aes_key,
-            commands::debug_entry_blob_info,
-            commands::debug_tamper_entry,
-            commands::debug_crypto_selftest,
+            debug::debug_kem_status,
+            debug::debug_dump_meta,
+            debug::debug_reset_vault_soft,
+            debug::debug_reset_vault_hard,
+            debug::debug_check_no_aes_in_meta,
+            debug::debug_step5_zeroize_print,
+            debug::debug_db_path,
+            debug::debug_vault_key_status,
+            debug::debug_list_schema,
+            debug::debug_decapsulate_status,
+            debug::debug_aes_key_exists,
+            debug::debug_zeroize_aes_key,
+            debug::debug_entry_blob_info,
+            debug::debug_tamper_entry,
+            debug::debug_crypto_selftest,
             commands::setup_verifier,
             #[cfg(debug_assertions)]
-            commands::debug_insert_bad_entry,
-            commands::debug_delete_device_key,
-            commands::debug_corrupt_manifest,
+            debug::debug_insert_bad_entry,
+            debug::debug_delete_device_key,
+            debug::debug_corrupt_manifest,
             commands::factory_reset_vault,
         ])
 }
