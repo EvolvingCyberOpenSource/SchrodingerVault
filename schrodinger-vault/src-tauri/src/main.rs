@@ -50,10 +50,10 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::greet,
-            commands::add_person,
-            commands::list_people,
-            commands::user_exists,
-            commands::create_vault,
+            vault_core::db::add_person,
+            vault_core::db::list_people,
+            vault_core::db::user_exists,
+            vault_core::db::create_vault,
             commands::unlock_vault,
             commands::lock_vault,
             commands::vault_list,
