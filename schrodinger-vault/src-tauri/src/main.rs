@@ -3,6 +3,7 @@
 
 // import rust files and folders
 mod commands;
+mod clipboard;
 mod debug;
 mod state;
 mod vault_core;
@@ -61,10 +62,10 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::vault_add,
             commands::vault_get,
             commands::vault_delete,
-            commands::copy_to_clipboard,
+            clipboard::copy_to_clipboard,
             #[cfg(target_os = "windows")]
-            commands::copy_to_clipboard_no_history,
-            commands::get_clipboard_text,
+            clipboard::copy_to_clipboard_no_history,
+            clipboard::get_clipboard_text,
             debug::debug_kem_status,
             debug::debug_dump_meta,
             debug::debug_reset_vault_soft,

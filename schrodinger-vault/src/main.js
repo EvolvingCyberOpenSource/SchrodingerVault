@@ -196,6 +196,25 @@ async function loadEntries() {
     }
 }
 
+// --- Generate a secure random password ---
+function generatePassword(length = 20) {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()_+-=[]{}|;:,.<>?";
+    const array = new Uint32Array(length);
+    crypto.getRandomValues(array);
+    return Array.from(array, v => chars[v % chars.length]).join("");
+}
+
+async function onGeneratePassword() {
+    const password = generatePassword();
+    passwordEl.value = password;
+    try {
+        await copyPasswordNoHistory(password);
+        showToast("Password generated & copied to clipboard");
+    } catch (e) {
+        showToast("Password generated");
+    }
+}
+
 // --- Add a new entry ---
 let labelEl;
 let usernameEl;
@@ -205,6 +224,7 @@ labelEl = document.querySelector("#label");
 usernameEl = document.querySelector("#username");
 passwordEl = document.querySelector("#password");
 notesEl = document.querySelector("#notes");
+document.querySelector("#gen-password-btn").addEventListener("click", onGeneratePassword);
 document.querySelector("#add-entry").addEventListener("submit", (e) => {
     e.preventDefault();
     addEntry();

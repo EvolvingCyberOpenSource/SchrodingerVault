@@ -336,6 +336,21 @@ button:disabled {
     width: auto;
 }
 
+#page-home .pw-field {
+    display: flex;
+    flex-direction: column;
+}
+
+#page-home .pw-field input {
+    margin-bottom: 4px;
+}
+
+#page-home .pw-field #gen-password-btn {
+    margin-bottom: 0;
+    font-size: 0.82rem;
+    padding: 0.35em 0.8em;
+}
+
 
 /* Entries frame */
 
