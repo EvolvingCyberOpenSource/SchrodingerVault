@@ -7,12 +7,16 @@ const createMessage = document.querySelector("#create-msg");
  * @returns {boolean} true if pasword meets requirements, false otherwise
  */
 function validatePassword(password, confirmPassword) {
+
   if (password !== confirmPassword) {
+
     createMessage.textContent = "Passwords do not match!";
     return false;
   }
 
+  
   if (password.length < 10) {
+    console.log("passwords too short");
     createMessage.textContent = "Password length is too short! (10 characters minimum)";
     return false;
   }
@@ -34,7 +38,12 @@ document.querySelector("#passwordForm").addEventListener("submit", async (e) => 
   const password = document.querySelector("#masterPassword").value;
   const confirm_Password = document.querySelector("#confirmPassword").value;
 
+
   console.log("password entered: ", password);
+
+  if (!validatePassword(password, confirm_Password)) {
+    return;
+  }
 
   try {
     // IMPORTANT: arg name must be snake_case to match Rust signature

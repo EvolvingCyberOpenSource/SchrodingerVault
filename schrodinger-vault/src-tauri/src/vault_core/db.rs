@@ -1,4 +1,4 @@
-use rusqlite::{Connection, Result, params, Row};
+use rusqlite::{Connection, Result, params, Row, OptionalExtension};
 use std::path::PathBuf;
 use tauri::{Manager, path::BaseDirectory};
 
@@ -203,3 +203,85 @@ pub fn get_entry_encrypted(conn: &Connection, id: i64) -> Result<Option<EncEntry
     }
 }
 
+// =========================
+// Meta table helpers
+// =========================
+
+/// Fetch a single meta value by key. Returns an error if the key is missing.
+pub fn get_meta(conn: &Connection, key: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key=?1",
+        [key],
+        |r| r.get::<_, String>(0),
+    )
+}
+
+/// Fetch a single meta value by key, returning None if not found.
+pub fn get_meta_optional(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key=?1",
+        [key],
+        |r| r.get::<_, String>(0),
+    ).optional()
+}
+
+/// Upsert a meta key/value pair.
+pub fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta(key, value) VALUES (?1, ?2)",
+        [key, value],
+    )?;
+    Ok(())
+}
+
+/// Fetch KDF params needed for vault unlock: (salt_pw_b64, kdf_label, kdf_params_json)
+pub fn get_kdf_meta(conn: &Connection) -> Result<(String, String, Option<String>)> {
+    Ok((
+        get_meta(conn, "salt_pw")?,
+        get_meta(conn, "kdf")?,
+        get_meta_optional(conn, "kdf_params")?,
+    ))
+}
+
+/// Fetch verifier fields for password check: (nonce_b64, ct_b64)
+pub fn get_verifier(conn: &Connection) -> Result<(String, String)> {
+    Ok((
+        get_meta(conn, "verifier_nonce")?,
+        get_meta(conn, "verifier_ct")?,
+    ))
+}
+
+/// Fetch manifest verification data: (stored_hash_b64, stored_sig_b64, dsa_pk_b64)
+pub fn get_manifest_verify_data(conn: &Connection) -> Result<(String, String, String)> {
+    Ok((
+        get_meta(conn, "manifest_hash")?,
+        get_meta(conn, "manifest_sig")?,
+        get_meta(conn, "dsa_pk")?,
+    ))
+}
+
+/// Concatenate the manifest-relevant meta values for hashing.
+pub fn build_manifest_input(conn: &Connection) -> String {
+    let mut input = String::new();
+    for key in ["salt_pw", "salt_kdf", "pk_kem", "ct_kem", "verifier_nonce", "verifier_ct"] {
+        input.push_str(&get_meta(conn, key).unwrap_or_default());
+    }
+    input
+}
+
+/// Delete all vault meta keys and entries in a single transaction.
+pub fn clear_vault_data(conn: &mut Connection) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM meta WHERE key IN (
+            'salt_pw','salt_kdf','kdf','kdf_params',
+            'pk_kem','ct_kem','kem_alg','alg',
+            'manifest_hash','manifest_sig',
+            'verifier_nonce','verifier_ct',
+            'dsa_pk'
+        )",
+        [],
+    )?;
+    tx.execute("DELETE FROM entries", [])?;
+    tx.commit()
+}
