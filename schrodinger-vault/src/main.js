@@ -455,18 +455,14 @@ window.addEventListener("DOMContentLoaded", async(e) => {
     resetIdleTimer();
 
     try {
-        // 1) Is vault initialized? If not, go create one.
-        const s = await invoke("debug_kem_status");
-        const initialized = s && (s.sk_exists || s.pk_kem_bytes_len > 0 || s.ct_kem_bytes_len > 0);
+        const initialized = await invoke("vault_exists");
         if (!initialized) {
             return window.location.replace("create.html");
         }
 
-        // 2) Is this session unlocked?
-        const { loaded } = await invoke("debug_vault_key_status");
+        const { loaded } = await invoke("vault_session_status");
         if (!loaded) return window.location.replace("unlock.html");
 
-        // 3) Good to load entries
         await loadEntries();
     } catch (err) {
         console.error("Init check failed:", err);

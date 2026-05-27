@@ -54,6 +54,6 @@ passwordForm.addEventListener("submit", async (e) => {
     window.location.replace("index.html");
   } catch (e) {
     console.error(e);
-    createMessage.textContent = "Failed to create vault. See console for details.";
+    createMessage.textContent = `Failed to create vault: ${String(e)}`;
   }
 });

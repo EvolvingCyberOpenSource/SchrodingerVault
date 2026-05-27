@@ -3,7 +3,6 @@
 
 // import rust files and folders
 mod commands;
-mod error;
 mod state;
 mod vault_core;
 
@@ -52,6 +51,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::add_person,
             commands::list_people,
             commands::user_exists,
+            commands::vault_exists,
             commands::create_vault,
             commands::unlock_vault,
             commands::change_master_password,
@@ -64,25 +64,45 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             #[cfg(target_os = "windows")]
             commands::copy_to_clipboard_no_history,
             commands::get_clipboard_text,
+            commands::vault_session_status,
+            #[cfg(debug_assertions)]
             commands::debug_kem_status,
+            #[cfg(debug_assertions)]
             commands::debug_dump_meta,
+            #[cfg(debug_assertions)]
             commands::debug_reset_vault_soft,
+            #[cfg(debug_assertions)]
             commands::debug_reset_vault_hard,
+            #[cfg(debug_assertions)]
             commands::debug_check_no_aes_in_meta,
+            #[cfg(debug_assertions)]
             commands::debug_step5_zeroize_print,
+            #[cfg(debug_assertions)]
+            commands::debug_hkdf_step5_zeroize_demo,
+            #[cfg(debug_assertions)]
             commands::debug_db_path,
+            #[cfg(debug_assertions)]
             commands::debug_vault_key_status,
+            #[cfg(debug_assertions)]
             commands::debug_list_schema,
+            #[cfg(debug_assertions)]
             commands::debug_decapsulate_status,
+            #[cfg(debug_assertions)]
             commands::debug_aes_key_exists,
+            #[cfg(debug_assertions)]
             commands::debug_zeroize_aes_key,
+            #[cfg(debug_assertions)]
             commands::debug_entry_blob_info,
+            #[cfg(debug_assertions)]
             commands::debug_tamper_entry,
+            #[cfg(debug_assertions)]
             commands::debug_crypto_selftest,
             commands::setup_verifier,
             #[cfg(debug_assertions)]
             commands::debug_insert_bad_entry,
+            #[cfg(debug_assertions)]
             commands::debug_delete_device_key,
+            #[cfg(debug_assertions)]
             commands::debug_corrupt_manifest,
             commands::factory_reset_vault,
         ])
@@ -106,7 +126,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|_app_handle, event| match event {
-            tauri::RunEvent::ExitRequested { api, .. } => {
+            tauri::RunEvent::ExitRequested { api: _, .. } => {
                 println!("App exit requested — cleaning up...");
                 commands::lock_vault();
             }
