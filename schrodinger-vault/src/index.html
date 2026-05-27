@@ -6,6 +6,7 @@
     <link rel="stylesheet" href="./styles.css" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Tauri App</title>
+    <script type="module" src="./theme.js" defer></script>
     <script type="module" src="./main.js" defer></script>
 </head>
 
@@ -14,6 +15,7 @@
       
         <!-- Top-right Lock Vault button -->
         <div class="top-right-controls">
+            <button type="button" class="btn-secondary theme-toggle-inline" data-theme-toggle aria-label="Toggle theme">☾</button>
             <button id="lock-vault-btn" class="btn-secondary">Lock Vault</button>
         </div>
 
