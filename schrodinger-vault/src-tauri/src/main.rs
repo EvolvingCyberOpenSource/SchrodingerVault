@@ -3,9 +3,9 @@
 
 // import rust files and folders
 mod commands;
+mod error;
 mod state;
 mod vault_core;
-mod error;
 
 // import rust tools and tauri
 use tauri::{self, Manager};
@@ -38,8 +38,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .setup(|app| {
             // create a connection to the database calling the function in vault_core/db.rs
-            let conn = crate::vault_core::db::open_and_init(&app.handle())
-                .expect("DB init failed");
+            let conn = crate::vault_core::db::open_and_init(&app.handle()).expect("DB init failed");
             // share the connection with all commands and create current state for the app
             app.manage(crate::state::AppDb(std::sync::Arc::new(
                 std::sync::Mutex::new(conn),
@@ -55,6 +54,7 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::user_exists,
             commands::create_vault,
             commands::unlock_vault,
+            commands::change_master_password,
             commands::lock_vault,
             commands::vault_list,
             commands::vault_add,
@@ -91,10 +91,9 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
 /// Launches the Tauri application.
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-
     // installing panic hook
     install_panic_hook();
-    
+
     // call lock_vault on ctrl+c from command line
     ctrlc::set_handler(|| {
         println!("Received termination signal — locking vault...");
@@ -126,4 +125,6 @@ pub fn run() {
 }
 
 // entry point, calls run right above
-fn main() { run(); }
+fn main() {
+    run();
+}

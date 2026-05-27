@@ -1,7 +1,6 @@
-use rusqlite::{Connection, Result, params, Row};
+use rusqlite::{params, Connection, Result, Row};
 use std::path::PathBuf;
-use tauri::{Manager, path::BaseDirectory};
-
+use tauri::{path::BaseDirectory, Manager};
 
 /// Resolves the full path to the `vault.sqlite` database file.
 ///
@@ -45,7 +44,6 @@ pub struct EncEntry {
     pub ciphertext: Vec<u8>,
     pub tag: Vec<u8>,
 }
-
 
 /// open the database and create schema if needed returning a connection object
 pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
@@ -120,7 +118,6 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
     Ok(conn)
 }
 
-
 /// Query functions for entries table.
 ///
 /// # Arguments
@@ -184,11 +181,9 @@ pub fn delete_entry(conn: &Connection, id: i64) -> Result<usize> {
     conn.execute("DELETE FROM entries WHERE id = ?1", params![id])
 }
 
-
 pub fn get_entry_encrypted(conn: &Connection, id: i64) -> Result<Option<EncEntry>> {
-    let mut stmt = conn.prepare(
-        "SELECT label, username, nonce, ciphertext, tag FROM entries WHERE id = ?1"
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT label, username, nonce, ciphertext, tag FROM entries WHERE id = ?1")?;
     let mut rows = stmt.query(params![id])?;
     if let Some(row) = rows.next()? {
         Ok(Some(EncEntry {
@@ -202,4 +197,3 @@ pub fn get_entry_encrypted(conn: &Connection, id: i64) -> Result<Option<EncEntry
         Ok(None)
     }
 }
-

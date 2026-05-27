@@ -8,6 +8,7 @@
     "dev": "tauri dev",
     "build": "tauri build",
     "build:mac": "tauri build --bundles app,dmg",
+    "build:mac:universal": "tauri build --target universal-apple-darwin --bundles app,dmg",
     "build:windows": "tauri build --bundles nsis,msi",
     "build:linux": "tauri build --bundles deb,rpm,appimage"
   },

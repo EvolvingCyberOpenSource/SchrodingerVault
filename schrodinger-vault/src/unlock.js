@@ -11,34 +11,20 @@ const MAX_FAILS = 5;
 const form = document.querySelector("#unlock-form");
 const msg  = document.querySelector("#unlock-msg");
 const unlockBtn = document.querySelector("#unlock-btn");
-const resetBtn = document.querySelector("#reset-btn");
+const passwordInput = document.querySelector("#password");
 
-resetBtn.style.display = "none";
-resetBtn.addEventListener("click", async () => {
-
-  resetBtn.disabled = true;
-  resetBtn.textContent = "Resetting...";
-
-  try {
-    await invoke("factory_reset_vault");
-
-    resetBtn.style.display = "none";
-    resetBtn.disabled = false;
-    unlockBtn.disabled = false;
-    window.location.replace("create.html");
-  } catch (err) {
-    msg.textContent = "Reset failed. Restart required.";
-  }
-
+passwordInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  form.requestSubmit();
 });
-
 
 // Handle the unlock form submit
 form.addEventListener("submit", async (e) => {
   e.preventDefault();          // stop normal form refreshs
   msg.textContent = "";        // clear any previous message
 
-  const pw = document.querySelector("#password").value; // get typed password
+  const pw = passwordInput.value; // get typed password
 
   try {
 
@@ -70,7 +56,6 @@ form.addEventListener("submit", async (e) => {
         msg.textContent =
             "This vault has been modified outside of Schrödinger Vault. Unlock blocked.";
         unlockBtn.disabled = true; 
-        resetBtn.style.display = "block";
         return;
     }
 
@@ -79,7 +64,6 @@ form.addEventListener("submit", async (e) => {
         msg.textContent =
             "Vault cannot be unlocked — device key missing or vault data corrupted.";
         unlockBtn.disabled = true;
-        resetBtn.style.display = "block";
         return;
     }
 

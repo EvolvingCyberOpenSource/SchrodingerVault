@@ -1,5 +1,14 @@
 const { invoke } = window.__TAURI__.core;
 const createMessage = document.querySelector("#create-msg");
+const passwordForm = document.querySelector("#passwordForm");
+
+function submitOnEnter(input, form) {
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    form.requestSubmit();
+  });
+}
 
 /**
  * Validates the password and confirm password fields.
@@ -28,13 +37,16 @@ function validatePassword(password, confirmPassword) {
  *
  * @returns {void}
  */
-document.querySelector("#passwordForm").addEventListener("submit", async (e) => {
+submitOnEnter(document.querySelector("#masterPassword"), passwordForm);
+submitOnEnter(document.querySelector("#confirmPassword"), passwordForm);
+
+passwordForm.addEventListener("submit", async (e) => {
   e.preventDefault();
 
   const password = document.querySelector("#masterPassword").value;
   const confirm_Password = document.querySelector("#confirmPassword").value;
 
-  console.log("password entered: ", password);
+  if (!validatePassword(password, confirm_Password)) return;
 
   try {
     // IMPORTANT: arg name must be snake_case to match Rust signature

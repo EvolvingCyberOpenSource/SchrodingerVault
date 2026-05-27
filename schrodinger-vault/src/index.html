@@ -16,43 +16,76 @@
         <!-- Top-right Lock Vault button -->
         <div class="top-right-controls">
             <button type="button" class="btn-secondary theme-toggle-inline" data-theme-toggle aria-label="Toggle theme">☾</button>
-            <button id="lock-vault-btn" class="btn-secondary">Lock Vault</button>
+            <nav class="app-tabs" aria-label="Vault sections">
+                <button type="button" class="tab-button active" data-tab-target="vault-panel">Vault</button>
+                <button type="button" class="tab-button" data-tab-target="settings-panel">Settings</button>
+                <button id="lock-vault-btn" type="button" class="tab-button">Lock Vault</button>
+            </nav>
         </div>
 
-        <h1>Schrödinger's Vault</h1>
+        <header class="home-header">
+            <img src="assets/SV-logo-full-purple.svg" alt="Schrödinger Vault logo" class="home-logo">
+            <h1>Schrödinger's Vault</h1>
+        </header>
         <div id="toast"></div>
 
+        <div id="vault-panel" class="tab-panel active">
+            <!-- Add entry form -->
+            <section aria-labelledby="create-entry">
+                <h2 id="create-entry" class="h3">Create a New Entry</h2>
+                <form id="add-entry" class="add-form" autocomplete="off">
+                    <div class="form-grid">
+                        <input id="label" name="label" placeholder="Label" required />
+                        <input id="username" name="username" placeholder="Username" required />
+                        <input id="password" name="password" type="password" placeholder="Password" required />
+                        <textarea id="notes" name="notes" placeholder="Notes (optional)"></textarea>
+                        <button type="submit" class="btn-accent icon-button add-entry-button" aria-label="Add entry" title="Add entry">
+                            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                        </button>
+                    </div>
+                </form>
+            </section>
 
-        <!-- Add entry form -->
-        <section aria-labelledby="create-entry">
-            <h2 id="create-entry" class="h3">Create a New Entry</h2>
-            <form id="add-entry" class="add-form" autocomplete="off">
-                <div class="form-grid">
-                    <input id="label" name="label" placeholder="Label" required />
-                    <input id="username" name="username" placeholder="Username" required />
-                    <input id="password" name="password" type="password" placeholder="Password" required />
-                    <textarea id="notes" name="notes" placeholder="Notes (optional)"></textarea>
-                </div>
-                <button type="submit" class="btn-accent">Add</button>
-            </form>
-        </section>
-
-        <!-- List entries -->
-        <section aria-labelledby="accounts">
-            <h2 id="accounts" class="h3">Accounts</h2>
-
-            <!-- Header -->
-            <div class="entries">
-                <div class="entries-header" role="row">
-                    <div class="h-label" role="columnheader">Label</div>
-                    <div class="h-username" role="columnheader">Username</div>
-                    <div class="h-password" role="columnheader">Password</div>
-                    <div class="h-notes" role="columnheader">Notes</div>
-                    <div class="h-actions" role="columnheader">Actions</div>
+            <!-- List entries -->
+            <section aria-labelledby="vault-items">
+                <div class="section-toolbar">
+                    <h2 id="vault-items" class="h3">Vault Items</h2>
+                    <input id="entry-search" class="search-input" type="search" placeholder="Search vault" autocomplete="off" />
                 </div>
 
-                <!-- Dynamic rows -->
-                <div id="entry-list" class="entry-list" role="rowgroup"></div>
+                <!-- Header -->
+                <div class="entries">
+                    <div class="entries-header" role="row">
+                        <div class="h-label" role="columnheader">Label</div>
+                        <div class="h-username" role="columnheader">Username</div>
+                        <div class="h-password" role="columnheader">Password</div>
+                        <div class="h-notes" role="columnheader">Notes</div>
+                        <div class="h-actions" role="columnheader">Actions</div>
+                    </div>
+
+                    <!-- Dynamic rows -->
+                    <div id="entry-list" class="entry-list" role="rowgroup"></div>
+                </div>
+            </section>
+        </div>
+
+        <section id="settings-panel" class="tab-panel settings-panel" aria-labelledby="settings-heading">
+            <h2 id="settings-heading" class="h3">Settings</h2>
+            <div class="settings-list">
+                <div class="settings-row">
+                    <div>
+                        <h3>Master Password</h3>
+                        <p>Update the password used to unlock this vault.</p>
+                    </div>
+                    <button id="change-password-btn" type="button" class="btn-secondary">Change Password</button>
+                </div>
+                <div class="settings-row danger-zone">
+                    <div>
+                        <h3>Reset Vault</h3>
+                        <p>Permanently delete this vault and all saved entries.</p>
+                    </div>
+                    <button id="factory-reset-btn" type="button" class="delete">Reset Vault</button>
+                </div>
             </div>
         </section>
 
@@ -67,14 +100,48 @@
     <div class="cell notes" role="cell"><span class="entry-notes"></span></div>
     <div class="cell actions" role="cell">
       <div class="row-actions">
-        <button type="button" class="show btn-secondary">Show</button>
-        <button type="button" class="copy btn-accent">Copy</button>
-        <button type="button" class="delete">Delete</button>
+        <button type="button" class="show btn-secondary icon-button" aria-label="Show password" title="Show password">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2.1 12s3.6-7 9.9-7 9.9 7 9.9 7-3.6 7-9.9 7-9.9-7-9.9-7Z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+        </button>
+        <button type="button" class="copy btn-accent icon-button" aria-label="Copy password" title="Copy password">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
+        </button>
+        <button type="button" class="delete icon-button" aria-label="Delete entry" title="Delete entry">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v5"></path><path d="M14 11v5"></path></svg>
+        </button>
       </div>
     </div>
     <span class="errorMsg"></span>
   </div>
 </template>
+
+        <dialog id="change-password-dialog" class="vault-dialog">
+            <form id="change-password-form" method="dialog" autocomplete="off">
+                <h2>Change Master Password</h2>
+                <p class="dialog-copy">Saved entries will be re-encrypted with the new password.</p>
+                <input id="current-master-password" name="current-master-password" type="password" placeholder="Current master password" required />
+                <input id="new-master-password" name="new-master-password" type="password" placeholder="New master password" minlength="10" required />
+                <input id="confirm-master-password" name="confirm-master-password" type="password" placeholder="Confirm new password" minlength="10" required />
+                <p id="change-password-msg" class="dialog-msg" aria-live="polite"></p>
+                <div class="dialog-actions">
+                    <button id="cancel-change-password" type="button" class="btn-secondary">Cancel</button>
+                    <button id="submit-change-password" type="submit" class="btn-accent">Update</button>
+                </div>
+            </form>
+        </dialog>
+
+        <dialog id="factory-reset-dialog" class="vault-dialog">
+            <form id="factory-reset-form" method="dialog" autocomplete="off">
+                <h2>Reset Vault</h2>
+                <p class="dialog-copy">This permanently deletes the vault and all saved entries.</p>
+                <input id="reset-master-password" name="reset-master-password" type="password" placeholder="Master password" required />
+                <p id="factory-reset-msg" class="dialog-msg" aria-live="polite"></p>
+                <div class="dialog-actions">
+                    <button id="cancel-factory-reset" type="button" class="btn-secondary">Cancel</button>
+                    <button id="submit-factory-reset" type="submit" class="delete">Reset Vault</button>
+                </div>
+            </form>
+        </dialog>
     </main>
 
 

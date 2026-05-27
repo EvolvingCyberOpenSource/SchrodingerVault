@@ -1,40 +1,41 @@
-use tauri::{command, AppHandle, State};
-use rusqlite::{params, OptionalExtension};
 use crate::state::AppDb;
 use crate::vault_core::db::{self, EntryListItem, NewEntry};
+use rusqlite::{params, Connection, OptionalExtension};
+use tauri::{command, AppHandle, State};
 
-use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes (reserved for future nonce use)
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
+use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes (reserved for future nonce use)
 
+use hkdf::Hkdf;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
-use hkdf::Hkdf;
 
+use arboard::Clipboard;
+use dirs;
 use oqs; // high-level, safe wrappers
-use std::{fs, io, path::{Path, PathBuf}};
+use oqs::kem::Algorithm;
+use secrecy::{ExposeSecret, SecretString};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::RwLock; // hold AES_KEY in RAM for the session, better than OnceLock since RwLock can be zeroized
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 use zeroize::{Zeroize, Zeroizing};
-use dirs;
-use secrecy::{SecretString, ExposeSecret};
-use oqs::kem::Algorithm;
-use arboard::Clipboard;
 
 #[cfg(target_os = "windows")]
 use windows::{
     core::w,
     Win32::{
-        Foundation::{HANDLE, HWND, HGLOBAL},
+        Foundation::{HANDLE, HGLOBAL, HWND},
         System::{
             DataExchange::{
                 CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
                 SetClipboardData,
             },
-            Memory::{
-                GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
-            },
+            Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT},
         },
     },
 };
@@ -42,13 +43,15 @@ use windows::{
 #[cfg(target_os = "windows")]
 const CF_UNICODETEXT: u32 = 13;
 
-use aes_gcm::{Aes256Gcm, aead::{AeadInPlace, KeyInit, generic_array::GenericArray}, Nonce};
-use crate::error::{ErrorCode, VaultError}; // enums and structs for error handling
+use crate::error::{ErrorCode, VaultError};
+use aes_gcm::{
+    aead::{generic_array::GenericArray, Aead, AeadInPlace, KeyInit},
+    Aes256Gcm, Nonce,
+}; // enums and structs for error handling
 
-// TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!), 
-// we will need to refactor and organize functions into other files when the core functionality is done 
+// TODO: Refactor. This file is messy and way too long (almost 900 lines as of writing this !!!!),
+// we will need to refactor and organize functions into other files when the core functionality is done
 // and call them here. and also add documentation and refine comments
-
 
 // =========================
 // Session AES key (RAM-only)
@@ -62,7 +65,6 @@ use crate::error::{ErrorCode, VaultError}; // enums and structs for error handli
 pub static VAULT_AES_KEY: std::sync::RwLock<Option<Zeroizing<[u8; 32]>>> =
     std::sync::RwLock::new(None);
 
-
 // =========================
 // RwLock helper functions
 // =========================
@@ -74,19 +76,15 @@ pub fn install_aes_key(key: &[u8; 32]) -> Result<(), &'static str> {
     Ok(())
 }
 
-
 // Reads currently installed AES key. Creates a stack copy, caller must zeroize.
 fn get_aes_key() -> Result<[u8; 32], &'static str> {
     use core::convert::TryInto;
 
     let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
-    guard
-        .as_ref()
-        .ok_or("vault locked")
-        .map(|key| {
-            let slice: &[u8] = key.as_ref();            // &Zeroizing<[u8;32]> → &[u8]
-            slice.try_into().expect("AES key wrong length") // &[u8] → [u8;32]
-        })
+    guard.as_ref().ok_or("vault locked").map(|key| {
+        let slice: &[u8] = key.as_ref(); // &Zeroizing<[u8;32]> → &[u8]
+        slice.try_into().expect("AES key wrong length") // &[u8] → [u8;32]
+    })
 }
 // Alternate function to get_aes_key which returns a reference instead of a stack copy, no need to zeroize.
 // Must use a guard when using this function. When guard is dropped the reference disppears.
@@ -99,8 +97,6 @@ fn get_aes_key_ref<'a>(
 ) -> Result<std::sync::RwLockReadGuard<'a, Option<Zeroizing<[u8; 32]>>>, &'static str> {
     VAULT_AES_KEY.read().map_err(|_| "lock poisoned")
 }
-
-
 
 // Wipe currently installed AES key (dropping Zeroizing wipes memory) #new
 fn zeroize_aes_key() -> Result<(), &'static str> {
@@ -162,7 +158,11 @@ fn encrypt_password(aes_key: &[u8; 32], password_utf8: &str) -> Result<SealResul
     out_tag.copy_from_slice(tag.as_slice());
     let ciphertext = buf.to_vec();
 
-    Ok(SealResult { nonce, ciphertext, tag: out_tag })
+    Ok(SealResult {
+        nonce,
+        ciphertext,
+        tag: out_tag,
+    })
 }
 
 fn decrypt_password(
@@ -180,7 +180,8 @@ fn decrypt_password(
         .decrypt_in_place_detached(nonce_ga, b"", &mut ciphertext, tag_ga)
         .map_err(|_| "Couldn't decrypt entry. It may be corrupted or tampered.".to_string())?;
 
-    let password = String::from_utf8(ciphertext).map_err(|_| "Decrypted data was not valid UTF-8".to_string())?;
+    let password = String::from_utf8(ciphertext)
+        .map_err(|_| "Decrypted data was not valid UTF-8".to_string())?;
     Ok(SecretString::from(password))
 }
 
@@ -242,13 +243,19 @@ pub fn greet(name: &str) -> String {
 }
 
 #[derive(serde::Serialize)]
-pub struct Person { pub id: i32, pub name: String }
+pub struct Person {
+    pub id: i32,
+    pub name: String,
+}
 
 #[command]
 pub fn add_person(db: State<AppDb>, name: String) -> Result<(), String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    conn.execute("INSERT INTO person (name, data) VALUES (?1, NULL)", params![name])
-        .map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO person (name, data) VALUES (?1, NULL)",
+        params![name],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -264,14 +271,22 @@ pub fn user_exists(db: State<AppDb>) -> Result<bool, String> {
 #[command]
 pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let mut stmt = conn.prepare("SELECT id, name FROM person ORDER BY id")
+    let mut stmt = conn
+        .prepare("SELECT id, name FROM person ORDER BY id")
         .map_err(|e| e.to_string())?;
-    let rows = stmt.query_map([], |row| {
-        Ok(Person { id: row.get(0)?, name: row.get(1)? })
-    }).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(Person {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
 
     let mut out = Vec::new();
-    for r in rows { out.push(r.map_err(|e| e.to_string())?); }
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
     Ok(out)
 }
 
@@ -281,7 +296,11 @@ pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
 // =========================
 
 #[command]
-pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) -> Result<bool, String> {
+pub fn create_vault(
+    _app: AppHandle,
+    db: State<AppDb>,
+    master_password: String,
+) -> Result<bool, String> {
     let master_password = SecretString::from(master_password);
 
     // Use the live, already-initialized connection
@@ -289,13 +308,13 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
 
     // salts (random)
     let mut r = rng();
-    let mut salt_pw  = [0u8; 32];
+    let mut salt_pw = [0u8; 32];
     let mut salt_kdf = [0u8; 32];
     r.fill_bytes(&mut salt_pw);
     r.fill_bytes(&mut salt_kdf);
 
     // Base64 for TEXT storage
-    let salt_pw_b64  = B64.encode(salt_pw);
+    let salt_pw_b64 = B64.encode(salt_pw);
     let salt_kdf_b64 = B64.encode(salt_kdf);
 
     // PBKDF2 params
@@ -305,11 +324,18 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
     // PBKDF2 derive K1 (RAM only)
     let iterations: u32 = 310_000;
     let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(master_password.expose_secret().as_bytes(), &salt_pw, iterations.into(), &mut k1);
-
+    pbkdf2_hmac::<Sha256>(
+        master_password.expose_secret().as_bytes(),
+        &salt_pw,
+        iterations.into(),
+        &mut k1,
+    );
 
     {
-        use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, OsRng, rand_core::RngCore}};
+        use aes_gcm::{
+            aead::{rand_core::RngCore, Aead, OsRng},
+            Aes256Gcm, KeyInit,
+        };
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
         let verifier_plain = b"vault-ok";
@@ -325,44 +351,43 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('verifier_nonce', ?1)",
             [B64.encode(&nonce)],
-        ).map_err(|_| "insert verifier_nonce failed")?;
+        )
+        .map_err(|_| "insert verifier_nonce failed")?;
 
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('verifier_ct', ?1)",
             [B64.encode(&verifier_ct)],
-        ).map_err(|_| "insert verifier_ct failed")?;
-
+        )
+        .map_err(|_| "insert verifier_ct failed")?;
     }
-    
 
     // Device KEM keypair + self-encapsulation (returns pk, ct, ss)
-    let (pk_kem_raw, ct_kem_raw) = generate_device_keypair()
-        .map_err(|e| e.to_string())?;
+    let (pk_kem_raw, ct_kem_raw) = generate_device_keypair().map_err(|e| e.to_string())?;
 
     // =======================================
     // ML-DSA KEYPAIR (signatures for manifest)
     // =======================================
-    use oqs::sig::{Sig, Algorithm as SigAlgorithm};
+    use oqs::sig::{Algorithm as SigAlgorithm, Sig};
 
-    let dsa = Sig::new(SigAlgorithm::MlDsa65)
-        .map_err(|e| format!("ML-DSA init failed: {}", e))?;
-    
+    let dsa = Sig::new(SigAlgorithm::MlDsa65).map_err(|e| format!("ML-DSA init failed: {}", e))?;
+
     let (dsa_pk, dsa_sk) = dsa
         .keypair()
         .map_err(|e| format!("ML-DSA keypair failed: {}", e))?;
-    
+
     let dsa_pk_b64 = B64.encode(dsa_pk.as_ref());
-    
+
     // store ML-DSA public key in meta
     conn.execute(
         "INSERT OR REPLACE INTO meta(key, value) VALUES ('dsa_pk', ?1)",
         [&dsa_pk_b64],
-    ).map_err(|e| format!("insert dsa_pk failed: {}", e))?;
-    
+    )
+    .map_err(|e| format!("insert dsa_pk failed: {}", e))?;
+
     // store ML-DSA secret key on disk next to mlkem768.sk
     let mut dsa_sk_path = keystore_path().map_err(|e| e.to_string())?;
     dsa_sk_path.set_file_name("ml_dsa.sk");
-    
+
     write_secret_key_secure(&dsa_sk_path, dsa_sk.as_ref())
         .map_err(|e| format!("write ML-DSA secret key failed: {}", e))?;
 
@@ -374,80 +399,119 @@ pub fn create_vault(_app: AppHandle, db: State<AppDb>, master_password: String) 
     // Store public/metadata only
     {
         let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"salt_pw",  &salt_pw_b64)).map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"salt_kdf", &salt_kdf_b64)).map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"kdf", kdf)).map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"kdf_params", kdf_params)).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"salt_pw", &salt_pw_b64),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"salt_kdf", &salt_kdf_b64),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"kdf", kdf),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"kdf_params", kdf_params),
+        )
+        .map_err(|e| e.to_string())?;
 
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"pk_kem", &pk_kem_b64)).map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"ct_kem", &ct_kem_b64)).map_err(|e| e.to_string())?;
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"kem_alg", kem_alg)).map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"pk_kem", &pk_kem_b64),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"ct_kem", &ct_kem_b64),
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"kem_alg", kem_alg),
+        )
+        .map_err(|e| e.to_string())?;
 
         // algorithm label string for the vault (public)
         let alg = "mlkem768|aes256gcm|hkdfsha256|pbkdf2";
-        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)", (&"alg", alg))
-          .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
+            (&"alg", alg),
+        )
+        .map_err(|e| e.to_string())?;
 
         tx.commit().map_err(|e| e.to_string())?;
         // Immediately wipe K1 after it's used for verifier + meta storage (intermediate secret)
         wipe_secret(&mut k1);
     }
 
-     // --- Manifest creation for tamper detection ---
-{
-    use sha2::{Digest, Sha256};
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    // --- Manifest creation for tamper detection ---
+    {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use sha2::{Digest, Sha256};
 
-    // Re-acquire a read handle
-    let mut manifest_input = String::new();
-    for key in ["salt_pw", "salt_kdf", "pk_kem", "ct_kem", "verifier_nonce", "verifier_ct"] {
-        let value: String = conn.query_row(
-            "SELECT value FROM meta WHERE key=?1", [key],
-            |r| r.get::<_, String>(0)
-        ).unwrap_or_default();
-        manifest_input.push_str(&value);
+        // Re-acquire a read handle
+        let mut manifest_input = String::new();
+        for key in [
+            "salt_pw",
+            "salt_kdf",
+            "pk_kem",
+            "ct_kem",
+            "verifier_nonce",
+            "verifier_ct",
+        ] {
+            let value: String = conn
+                .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default();
+            manifest_input.push_str(&value);
+        }
+
+        // Compute hash
+        let manifest_hash = Sha256::digest(manifest_input.as_bytes());
+        let manifest_b64 = B64.encode(manifest_hash);
+
+        // -------- REAL ML-DSA SIGNATURE --------
+
+        let mut dsa_sk_path = keystore_path().map_err(|e| e.to_string())?;
+        dsa_sk_path.set_file_name("ml_dsa.sk");
+
+        let dsa_sk_bytes =
+            std::fs::read(&dsa_sk_path).map_err(|e| format!("read ml_dsa.sk failed: {e}"))?;
+
+        let dsa =
+            Sig::new(SigAlgorithm::MlDsa65).map_err(|e| format!("ML-DSA init failed: {}", e))?;
+
+        let dsa_sk_ref = dsa
+            .secret_key_from_bytes(&dsa_sk_bytes)
+            .ok_or("Invalid ML-DSA secret key")?;
+
+        let sig = dsa
+            .sign(manifest_hash.as_ref(), dsa_sk_ref)
+            .map_err(|e| format!("ML-DSA sign failed: {}", e))?;
+
+        let signature_b64 = B64.encode(sig.as_ref());
+
+        // Store both into meta
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_hash', ?1)",
+            [&manifest_b64],
+        )
+        .map_err(|e| format!("insert manifest_hash failed: {e}"))?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_sig', ?1)",
+            [&signature_b64],
+        )
+        .map_err(|e| format!("insert manifest_sig failed: {e}"))?;
     }
-
-    // Compute hash
-    let manifest_hash = Sha256::digest(manifest_input.as_bytes());
-    let manifest_b64 = B64.encode(manifest_hash);
-
-    // -------- REAL ML-DSA SIGNATURE --------
-
-    let mut dsa_sk_path = keystore_path().map_err(|e| e.to_string())?;
-    dsa_sk_path.set_file_name("ml_dsa.sk");
-
-    let dsa_sk_bytes = std::fs::read(&dsa_sk_path)
-        .map_err(|e| format!("read ml_dsa.sk failed: {e}"))?;
-
-    let dsa = Sig::new(SigAlgorithm::MlDsa65)
-        .map_err(|e| format!("ML-DSA init failed: {}", e))?;
-
-    let dsa_sk_ref = dsa
-        .secret_key_from_bytes(&dsa_sk_bytes)
-        .ok_or("Invalid ML-DSA secret key")?;
-
-    let sig = dsa
-        .sign(manifest_hash.as_ref(), dsa_sk_ref)
-        .map_err(|e| format!("ML-DSA sign failed: {}", e))?;
-
-    let signature_b64 = B64.encode(sig.as_ref());
-
-    // Store both into meta
-    conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_hash', ?1)",
-        [&manifest_b64],
-    ).map_err(|e| format!("insert manifest_hash failed: {e}"))?;
-    
-    conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_sig', ?1)",
-        [&signature_b64],
-    ).map_err(|e| format!("insert manifest_sig failed: {e}"))?;
-
-}
     Ok(true)
 }
-
 
 // Step 2 helper — Recover device secret (ss) using ML-KEM-768
 
@@ -479,11 +543,9 @@ fn recover_device_secret(db: &State<AppDb>) -> Result<[u8; 32], String> {
     // 1) Fetch ct_kem (b64) from meta
     let ct_kem_b64: String = {
         let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-        conn.query_row(
-            "SELECT value FROM meta WHERE key='ct_kem'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
+        conn.query_row("SELECT value FROM meta WHERE key='ct_kem'", [], |r| {
+            r.get::<_, String>(0)
+        })
         .map_err(|_| "missing meta key: ct_kem".to_string())?
     };
 
@@ -528,6 +590,125 @@ fn recover_device_secret(db: &State<AppDb>) -> Result<[u8; 32], String> {
     Ok(ss)
 }
 
+fn kdf_iterations(kdf_params_json: Option<String>) -> u32 {
+    kdf_params_json
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("iterations")
+                .and_then(|i| i.as_u64())
+                .map(|n| n as u32)
+        })
+        .unwrap_or(310_000)
+}
+
+fn derive_k1(password: &SecretString, salt_pw: &[u8], iterations: u32) -> [u8; 32] {
+    let mut k1 = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(
+        password.expose_secret().as_bytes(),
+        salt_pw,
+        iterations,
+        &mut k1,
+    );
+    k1
+}
+
+fn verify_k1(conn: &Connection, k1: &[u8; 32]) -> Result<(), String> {
+    use aes_gcm::aead::generic_array::GenericArray;
+    use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
+
+    let nonce_b64: String = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='verifier_nonce'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|_| "missing verifier_nonce")?;
+    let ct_b64: String = conn
+        .query_row("SELECT value FROM meta WHERE key='verifier_ct'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(|_| "missing verifier_ct")?;
+
+    let nonce = B64.decode(&nonce_b64).map_err(|_| "nonce decode failed")?;
+    let ct = B64
+        .decode(&ct_b64)
+        .map_err(|_| "verifier_ct decode failed")?;
+    let nonce_ga = GenericArray::from_slice(&nonce);
+
+    let cipher = Aes256Gcm::new_from_slice(k1).map_err(|_| "cipher init failed")?;
+    let plaintext = cipher
+        .decrypt(nonce_ga, ct.as_ref())
+        .map_err(|_| "That password didn’t work.".to_string())?;
+
+    if plaintext != b"vault-ok" {
+        return Err("That password didn’t work.".into());
+    }
+
+    Ok(())
+}
+
+fn derive_vault_key(k1: &[u8; 32], salt_kdf: &[u8], ss: &[u8; 32]) -> Result<[u8; 32], String> {
+    let hk_k1 = Hkdf::<Sha256>::new(Some(salt_kdf), k1);
+    let mut prk1 = [0u8; 32];
+    hk_k1.expand(&[], &mut prk1).map_err(|e| e.to_string())?;
+
+    let hk_final = Hkdf::<Sha256>::new(Some(&prk1), ss);
+    let mut aes_key = [0u8; 32];
+    hk_final
+        .expand(b"vault-key", &mut aes_key)
+        .map_err(|_| "HKDF expand failed".to_string())?;
+
+    prk1.zeroize();
+    Ok(aes_key)
+}
+
+fn verify_master_password(conn: &Connection, password: &SecretString) -> Result<(), String> {
+    let salt_pw_b64: String = conn
+        .query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(|_| "missing meta key: salt_pw")?;
+    let kdf_params_json: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    let salt_pw = B64
+        .decode(&salt_pw_b64)
+        .map_err(|_| "salt_pw decode failed")?;
+    let iterations = kdf_iterations(kdf_params_json);
+    let mut k1 = derive_k1(password, &salt_pw, iterations);
+    let result = verify_k1(conn, &k1);
+    k1.zeroize();
+    result
+}
+
+fn sign_manifest_input(manifest_input: &str) -> Result<(String, String), String> {
+    use oqs::sig::{Algorithm as SigAlgorithm, Sig};
+    use sha2::{Digest, Sha256};
+
+    let manifest_hash = Sha256::digest(manifest_input.as_bytes());
+    let manifest_b64 = B64.encode(manifest_hash);
+
+    let mut dsa_sk_path = keystore_path().map_err(|e| e.to_string())?;
+    dsa_sk_path.set_file_name("ml_dsa.sk");
+    let mut dsa_sk_bytes =
+        std::fs::read(&dsa_sk_path).map_err(|e| format!("read ml_dsa.sk failed: {e}"))?;
+
+    let dsa = Sig::new(SigAlgorithm::MlDsa65).map_err(|e| format!("ML-DSA init failed: {}", e))?;
+    let dsa_sk_ref = dsa
+        .secret_key_from_bytes(&dsa_sk_bytes)
+        .ok_or("Invalid ML-DSA secret key")?;
+    let sig = dsa
+        .sign(manifest_hash.as_ref(), dsa_sk_ref)
+        .map_err(|e| format!("ML-DSA sign failed: {}", e))?;
+    dsa_sk_bytes.zeroize();
+
+    Ok((manifest_b64, B64.encode(sig.as_ref())))
+}
 
 #[command]
 pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Result<bool, String> {
@@ -537,27 +718,37 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
     let (salt_pw_b64, kdf_label, kdf_params_json): (String, String, Option<String>) = {
         let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
         let get = |k: &str| -> Result<String, String> {
-            conn.query_row("SELECT value FROM meta WHERE key=?1", [k], |r| r.get::<_, String>(0))
-                .map_err(|_| format!("missing meta key: {k}"))
+            conn.query_row("SELECT value FROM meta WHERE key=?1", [k], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| format!("missing meta key: {k}"))
         };
         (
-            get("salt_pw")?,                         
-            get("kdf")?,                            
-            conn.query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| r.get::<_, String>(0))
-                .optional()
-                .map_err(|e| e.to_string())?,       
+            get("salt_pw")?,
+            get("kdf")?,
+            conn.query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?,
         )
     };
 
-    // decodeing salt_pw 
-    let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode failed")?;
+    // decodeing salt_pw
+    let salt_pw = B64
+        .decode(&salt_pw_b64)
+        .map_err(|_| "salt_pw decode failed")?;
 
     // getting num of pbdkf2 iterations (uses 310_000 as a default)
     let iterations: u32 = kdf_params_json
-    .as_deref()
-    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-    .and_then(|v| v.get("iterations").and_then(|i| i.as_u64()).map(|n| n as u32))
-    .unwrap_or(310_000);
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("iterations")
+                .and_then(|i| i.as_u64())
+                .map(|n| n as u32)
+        })
+        .unwrap_or(310_000);
 
     // deriving k1
     let mut k1 = [0u8; 32];
@@ -568,29 +759,37 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
         &mut k1,
     );
 
-      {
-        use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
+    {
         use aes_gcm::aead::generic_array::GenericArray;
+        use aes_gcm::{aead::Aead, Aes256Gcm, KeyInit};
         use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    
+
         // Fetch verifier data from DB
         let (nonce_b64, ct_b64): (String, String) = {
             let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
             (
-                conn.query_row("SELECT value FROM meta WHERE key='verifier_nonce'", [], |r| r.get::<_, String>(0))
-                    .map_err(|_| "missing verifier_nonce")?,
-                conn.query_row("SELECT value FROM meta WHERE key='verifier_ct'", [], |r| r.get::<_, String>(0))
-                    .map_err(|_| "missing verifier_ct")?,
+                conn.query_row(
+                    "SELECT value FROM meta WHERE key='verifier_nonce'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|_| "missing verifier_nonce")?,
+                conn.query_row("SELECT value FROM meta WHERE key='verifier_ct'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(|_| "missing verifier_ct")?,
             )
         };
-    
+
         // Decode Base64 verifier data
         let nonce = B64.decode(&nonce_b64).map_err(|_| "nonce decode failed")?;
-        let ct = B64.decode(&ct_b64).map_err(|_| "verifier_ct decode failed")?;
-    
+        let ct = B64
+            .decode(&ct_b64)
+            .map_err(|_| "verifier_ct decode failed")?;
+
         // Convert nonce into AES-GCM GenericArray (required by decrypt)
         let nonce_ga = GenericArray::from_slice(&nonce);
-    
+
         // Attempt to decrypt verifier with derived K1
         let cipher = Aes256Gcm::new_from_slice(&k1).map_err(|_| "cipher init failed")?;
         match cipher.decrypt(nonce_ga, ct.as_ref()) {
@@ -607,88 +806,94 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
         }
     }
 
-        // --- Manifest verification for tamper detection ---
-        {
-            use sha2::{Digest, Sha256};
-            use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-            use oqs::sig::{Sig, Algorithm as SigAlgorithm};
-    
-            let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    
-            // 1) Rebuild manifest input exactly like in create_vault
-            let mut manifest_input = String::new();
-            for key in ["salt_pw", "salt_kdf", "pk_kem", "ct_kem", "verifier_nonce", "verifier_ct"] {
-                let value: String = conn.query_row(
-                    "SELECT value FROM meta WHERE key=?1",
-                    [key],
-                    |r| r.get::<_, String>(0),
-                ).unwrap_or_default();
-                manifest_input.push_str(&value);
-            }
-    
-            // 2) Compute fresh SHA-256 hash and base64-encode it
-            let manifest_hash = Sha256::digest(manifest_input.as_bytes());
-            let manifest_b64 = B64.encode(manifest_hash);
-    
-            // 3) Load stored manifest hash + signature + ML-DSA public key
-            let stored_hash_b64: String = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key='manifest_hash'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|_| "missing manifest_hash")?;
-    
-            let stored_sig_b64: String = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key='manifest_sig'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|_| "missing manifest_sig")?;
-    
-            let dsa_pk_b64: String = conn
-                .query_row(
-                    "SELECT value FROM meta WHERE key='dsa_pk'",
-                    [],
-                    |r| r.get(0),
-                )
-                .map_err(|_| "missing dsa_pk")?;
-    
-            // 4) First check: hash equality (simple tamper check)
-            if manifest_b64 != stored_hash_b64 {
-                k1.zeroize(); 
-                return Err("This vault has been modified outside of Schrödinger Vault. Unlock blocked.".into());
-            }
-    
-            // 5) Decode signature + public key from base64
-            let sig_bytes = B64
-                .decode(stored_sig_b64.as_bytes())
-                .map_err(|_| "manifest_sig decode failed")?;
-    
-            let pk_bytes = B64
-                .decode(dsa_pk_b64.as_bytes())
-                .map_err(|_| "dsa_pk decode failed")?;
-    
-            // 6) Initialize ML-DSA verifier
-            let dsa = Sig::new(SigAlgorithm::MlDsa65)
-                .map_err(|e| format!("ML-DSA init failed: {}", e))?;
-    
-            let pk_ref = dsa
-                .public_key_from_bytes(&pk_bytes)
-                .ok_or("Invalid ML-DSA public key")?;
-    
-            let sig_ref = dsa
-                .signature_from_bytes(&sig_bytes)
-                .ok_or("Invalid ML-DSA signature")?;
-    
-            // manifest_hash is raw bytes; we signed exactly these bytes in create_vault
-            if let Err(e) = dsa.verify(manifest_hash.as_ref(), sig_ref, pk_ref) {
-                k1.zeroize(); 
-                return Err("This vault has been modified outside of Schrödinger Vault. Unlock blocked.".into());
-            }
+    // --- Manifest verification for tamper detection ---
+    {
+        use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+        use oqs::sig::{Algorithm as SigAlgorithm, Sig};
+        use sha2::{Digest, Sha256};
+
+        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+
+        // 1) Rebuild manifest input exactly like in create_vault
+        let mut manifest_input = String::new();
+        for key in [
+            "salt_pw",
+            "salt_kdf",
+            "pk_kem",
+            "ct_kem",
+            "verifier_nonce",
+            "verifier_ct",
+        ] {
+            let value: String = conn
+                .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| {
+                    r.get::<_, String>(0)
+                })
+                .unwrap_or_default();
+            manifest_input.push_str(&value);
         }
 
+        // 2) Compute fresh SHA-256 hash and base64-encode it
+        let manifest_hash = Sha256::digest(manifest_input.as_bytes());
+        let manifest_b64 = B64.encode(manifest_hash);
+
+        // 3) Load stored manifest hash + signature + ML-DSA public key
+        let stored_hash_b64: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='manifest_hash'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|_| "missing manifest_hash")?;
+
+        let stored_sig_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='manifest_sig'", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| "missing manifest_sig")?;
+
+        let dsa_pk_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='dsa_pk'", [], |r| {
+                r.get(0)
+            })
+            .map_err(|_| "missing dsa_pk")?;
+
+        // 4) First check: hash equality (simple tamper check)
+        if manifest_b64 != stored_hash_b64 {
+            k1.zeroize();
+            return Err(
+                "This vault has been modified outside of Schrödinger Vault. Unlock blocked.".into(),
+            );
+        }
+
+        // 5) Decode signature + public key from base64
+        let sig_bytes = B64
+            .decode(stored_sig_b64.as_bytes())
+            .map_err(|_| "manifest_sig decode failed")?;
+
+        let pk_bytes = B64
+            .decode(dsa_pk_b64.as_bytes())
+            .map_err(|_| "dsa_pk decode failed")?;
+
+        // 6) Initialize ML-DSA verifier
+        let dsa =
+            Sig::new(SigAlgorithm::MlDsa65).map_err(|e| format!("ML-DSA init failed: {}", e))?;
+
+        let pk_ref = dsa
+            .public_key_from_bytes(&pk_bytes)
+            .ok_or("Invalid ML-DSA public key")?;
+
+        let sig_ref = dsa
+            .signature_from_bytes(&sig_bytes)
+            .ok_or("Invalid ML-DSA signature")?;
+
+        // manifest_hash is raw bytes; we signed exactly these bytes in create_vault
+        if let Err(e) = dsa.verify(manifest_hash.as_ref(), sig_ref, pk_ref) {
+            k1.zeroize();
+            return Err(
+                "This vault has been modified outside of Schrödinger Vault. Unlock blocked.".into(),
+            );
+        }
+    }
 
     // Implemented: Step 2 decapsulation to recover ss (RAM-only). check recover_device_secret function above unlock_vault command
     match recover_device_secret(&db) {
@@ -698,12 +903,16 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
             // Load salt_kdf in b64 from meta
             let salt_kdf_b64: String = {
                 let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-                conn.query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| r.get::<_, String>(0))
-                    .map_err(|_| "missing meta key: salt_kdf")?
+                conn.query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map_err(|_| "missing meta key: salt_kdf")?
             };
 
             // Decode from b64
-            let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode failed")?;
+            let salt_kdf = B64
+                .decode(&salt_kdf_b64)
+                .map_err(|_| "salt_kdf decode failed")?;
 
             // Blend K1 and ss via HKDF-SHA256
             let hk_k1 = Hkdf::<Sha256>::new(Some(&salt_kdf), &k1);
@@ -715,7 +924,9 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
 
             // Expand to AES key
             let mut aes_key_tmp = [0u8; 32];
-            hk_final.expand(b"vault-key", &mut aes_key_tmp).map_err(|_| "HKDF expand failed")?;
+            hk_final
+                .expand(b"vault-key", &mut aes_key_tmp)
+                .map_err(|_| "HKDF expand failed")?;
 
             // #new
             // Wrap AES key so it wipes automatically when dropped, then install.
@@ -726,14 +937,215 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
             ss_zero.zeroize();
             k1.zeroize();
 
-            return Ok(true)
+            return Ok(true);
         }
         Err(e) => {
             // Explicit, user-friendly error if SK missing or ct_kem corrupted
             k1.zeroize();
-            return Err("Vault cannot be unlocked — device key missing or vault data corrupted.".into());
+            return Err(
+                "Vault cannot be unlocked — device key missing or vault data corrupted.".into(),
+            );
         }
     }
+}
+
+#[command]
+pub fn change_master_password(
+    db: State<AppDb>,
+    current_password: String,
+    new_password: String,
+) -> Result<bool, String> {
+    if current_password.is_empty() {
+        return Err("Current master password is required".into());
+    }
+    if new_password.len() < 10 {
+        return Err("New master password must be at least 10 characters".into());
+    }
+    if current_password == new_password {
+        return Err("New master password must be different".into());
+    }
+
+    let current_password = SecretString::from(current_password);
+    let new_password = SecretString::from(new_password);
+
+    let mut ss = recover_device_secret(&db)?;
+    let mut old_k1 = [0u8; 32];
+    let mut old_aes_key = [0u8; 32];
+    let mut new_k1 = [0u8; 32];
+    let mut new_aes_key = [0u8; 32];
+
+    let result = (|| -> Result<bool, String> {
+        let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+
+        let salt_pw_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: salt_pw")?;
+        let pk_kem_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='pk_kem'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: pk_kem")?;
+        let ct_kem_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='ct_kem'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: ct_kem")?;
+        let salt_kdf_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: salt_kdf")?;
+        let kdf_params_json: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        let salt_pw = B64
+            .decode(&salt_pw_b64)
+            .map_err(|_| "salt_pw decode failed")?;
+        let salt_kdf = B64
+            .decode(&salt_kdf_b64)
+            .map_err(|_| "salt_kdf decode failed")?;
+        let iterations = kdf_iterations(kdf_params_json);
+
+        old_k1 = derive_k1(&current_password, &salt_pw, iterations);
+        verify_k1(&conn, &old_k1)?;
+        old_aes_key = derive_vault_key(&old_k1, &salt_kdf, &ss)?;
+
+        let mut plaintext_entries: Vec<(i64, SecretString)> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, nonce, ciphertext, tag FROM entries ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+
+            for row in rows {
+                let (id, nonce, ciphertext, tag) = row.map_err(|e| e.to_string())?;
+                if nonce.len() != 12 || tag.len() != 16 {
+                    return Err("Entry is corrupt (invalid nonce/tag size)".into());
+                }
+                let mut nonce12 = [0u8; 12];
+                nonce12.copy_from_slice(&nonce);
+                let mut tag16 = [0u8; 16];
+                tag16.copy_from_slice(&tag);
+                let secret = decrypt_password(&old_aes_key, &nonce12, ciphertext, &tag16)?;
+                nonce12.zeroize();
+                tag16.zeroize();
+                plaintext_entries.push((id, secret));
+            }
+        }
+
+        let mut r = rng();
+        let mut new_salt_pw = [0u8; 32];
+        let mut new_salt_kdf = [0u8; 32];
+        r.fill_bytes(&mut new_salt_pw);
+        r.fill_bytes(&mut new_salt_kdf);
+
+        new_k1 = derive_k1(&new_password, &new_salt_pw, iterations);
+        new_aes_key = derive_vault_key(&new_k1, &new_salt_kdf, &ss)?;
+
+        let cipher = Aes256Gcm::new_from_slice(&new_k1).map_err(|_| "cipher init failed")?;
+        let mut verifier_nonce = [0u8; 12];
+        r.fill_bytes(&mut verifier_nonce);
+        let verifier_ct = cipher
+            .encrypt(&verifier_nonce.into(), b"vault-ok".as_ref())
+            .map_err(|_| "verifier encryption failed".to_string())?;
+
+        let new_salt_pw_b64 = B64.encode(new_salt_pw);
+        let new_salt_kdf_b64 = B64.encode(new_salt_kdf);
+        let verifier_nonce_b64 = B64.encode(verifier_nonce);
+        let verifier_ct_b64 = B64.encode(&verifier_ct);
+        let manifest_input = format!(
+            "{}{}{}{}{}{}",
+            new_salt_pw_b64,
+            new_salt_kdf_b64,
+            pk_kem_b64,
+            ct_kem_b64,
+            verifier_nonce_b64,
+            verifier_ct_b64
+        );
+        let (manifest_hash_b64, manifest_sig_b64) = sign_manifest_input(&manifest_input)?;
+
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (id, secret) in &plaintext_entries {
+            let sealed = encrypt_password(&new_aes_key, secret.expose_secret())?;
+            tx.execute(
+                r#"
+                UPDATE entries
+                SET nonce = ?1, ciphertext = ?2, tag = ?3,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?4
+                "#,
+                params![
+                    sealed.nonce.as_slice(),
+                    sealed.ciphertext.as_slice(),
+                    sealed.tag.as_slice(),
+                    id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('salt_pw', ?1)",
+            [&new_salt_pw_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('salt_kdf', ?1)",
+            [&new_salt_kdf_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('verifier_nonce', ?1)",
+            [&verifier_nonce_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('verifier_ct', ?1)",
+            [&verifier_ct_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_hash', ?1)",
+            [&manifest_hash_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_sig', ?1)",
+            [&manifest_sig_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+
+        install_aes_key(&new_aes_key).map_err(|e| e.to_string())?;
+
+        new_salt_pw.zeroize();
+        new_salt_kdf.zeroize();
+        verifier_nonce.zeroize();
+        Ok(true)
+    })();
+
+    ss.zeroize();
+    old_k1.zeroize();
+    old_aes_key.zeroize();
+    new_k1.zeroize();
+    new_aes_key.zeroize();
+
+    result
 }
 
 #[command]
@@ -747,30 +1159,37 @@ pub fn lock_vault() {
 fn generate_device_keypair() -> Result<(Vec<u8>, Vec<u8>), String> {
     oqs::init();
 
-    let kem = oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768)
-        .map_err(|e| format!("kem new: {e}"))?;
+    let kem =
+        oqs::kem::Kem::new(oqs::kem::Algorithm::MlKem768).map_err(|e| format!("kem new: {e}"))?;
 
-    let (pk_kem, sk_kem) = kem.keypair()
-        .map_err(|e| format!("keypair: {e}"))?;
+    let (pk_kem, sk_kem) = kem.keypair().map_err(|e| format!("keypair: {e}"))?;
 
-    let (ct_kem, ss_raw) = kem.encapsulate(&pk_kem)
+    let (ct_kem, ss_raw) = kem
+        .encapsulate(&pk_kem)
         .map_err(|e| format!("encapsulate: {e}"))?;
 
     // Write SK securely to app-private keystore
     let sk_path = keystore_path().map_err(|e| format!("keystore_path: {e}"))?;
-    write_secret_key_secure(&sk_path, sk_kem.as_ref())
-        .map_err(|e| format!("write sk: {e}"))?;
+    write_secret_key_secure(&sk_path, sk_kem.as_ref()).map_err(|e| format!("write sk: {e}"))?;
 
-    Ok((
-        pk_kem.as_ref().to_vec(),
-        ct_kem.as_ref().to_vec(),
-    ))
+    Ok((pk_kem.as_ref().to_vec(), ct_kem.as_ref().to_vec()))
 }
-
 
 // function is meant to be tirggered on a vault reset and then frontend should send user back to create vault screen
 #[command]
-pub fn factory_reset_vault(app: AppHandle, db: State<AppDb>) -> Result<bool, String> {
+pub fn factory_reset_vault(
+    app: AppHandle,
+    db: State<AppDb>,
+    master_password: String,
+) -> Result<bool, String> {
+    if master_password.is_empty() {
+        return Err("Master password is required to reset the vault".into());
+    }
+    {
+        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+        let master_password = SecretString::from(master_password);
+        verify_master_password(&conn, &master_password)?;
+    }
 
     // delete ML-KEM key
     let sk_path = keystore_path().map_err(|e| e.to_string())?;
@@ -781,7 +1200,7 @@ pub fn factory_reset_vault(app: AppHandle, db: State<AppDb>) -> Result<bool, Str
     dsa_path.set_file_name("ml_dsa.sk");
     remove_file_if_exists(&dsa_path).ok();
 
-    // delete meta + entries 
+    // delete meta + entries
     {
         let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
         let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -795,7 +1214,8 @@ pub fn factory_reset_vault(app: AppHandle, db: State<AppDb>) -> Result<bool, Str
                 'dsa_pk'
             )",
             [],
-        ).map_err(|e| e.to_string())?;
+        )
+        .map_err(|e| e.to_string())?;
 
         tx.execute("DELETE FROM entries", [])
             .map_err(|e| e.to_string())?;
@@ -840,19 +1260,32 @@ pub struct KemStatus {
 
 #[command]
 pub fn debug_kem_status(db: State<AppDb>) -> Result<KemStatus, String> {
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    let conn = db
+        .inner()
+        .0
+        .lock()
+        .map_err(|_| "DB lock poisoned".to_string())?;
 
-    let pk_b64: Option<String> = conn.query_row(
-        "SELECT value FROM meta WHERE key = 'pk_kem'", [], |r| r.get(0)
-    ).optional().map_err(|e| e.to_string())?;
+    let pk_b64: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'pk_kem'", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
 
-    let ct_b64: Option<String> = conn.query_row(
-        "SELECT value FROM meta WHERE key = 'ct_kem'", [], |r| r.get(0)
-    ).optional().map_err(|e| e.to_string())?;
+    let ct_b64: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'ct_kem'", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
 
-    let kem_alg: Option<String> = conn.query_row(
-        "SELECT value FROM meta WHERE key = 'kem_alg'", [], |r| r.get(0)
-    ).optional().map_err(|e| e.to_string())?;
+    let kem_alg: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'kem_alg'", [], |r| {
+            r.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
 
     let (pk_kem_b64_len, pk_kem_bytes_len) = match pk_b64 {
         Some(ref s) => (s.len(), B64.decode(s).map(|v| v.len()).unwrap_or(0)),
@@ -866,7 +1299,11 @@ pub fn debug_kem_status(db: State<AppDb>) -> Result<KemStatus, String> {
     let sk_path_pb = keystore_path().map_err(|e| e.to_string())?;
     let sk_path = sk_path_pb.to_string_lossy().to_string();
     let sk_exists = sk_path_pb.exists();
-    let sk_len = if sk_exists { fs::metadata(&sk_path_pb).ok().map(|m| m.len()) } else { None };
+    let sk_len = if sk_exists {
+        fs::metadata(&sk_path_pb).ok().map(|m| m.len())
+    } else {
+        None
+    };
 
     Ok(KemStatus {
         pk_kem_b64_len,
@@ -888,7 +1325,11 @@ pub struct MetaRow {
 
 #[command]
 pub fn debug_dump_meta(db: State<AppDb>) -> Result<Vec<MetaRow>, String> {
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned".to_string())?;
+    let conn = db
+        .inner()
+        .0
+        .lock()
+        .map_err(|_| "DB lock poisoned".to_string())?;
     let mut stmt = conn
         .prepare("SELECT key, value FROM meta ORDER BY key")
         .map_err(|e| e.to_string())?;
@@ -929,7 +1370,8 @@ pub fn debug_reset_vault_soft(db: State<AppDb>) -> Result<bool, String> {
             'salt_pw','salt_kdf','kdf','kdf_params','pk_kem','ct_kem','kem_alg','alg'
         )",
         [],
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
 
     println!("(reset) soft reset done (keystore + meta cleared; entries kept)");
@@ -975,7 +1417,9 @@ pub fn debug_reset_vault_hard(app: AppHandle, db: State<AppDb>) -> Result<bool, 
         let _old = std::mem::replace(&mut *guard, new_conn);
     }
 
-    println!("(reset) hard reset done (entries wiped, keystore removed, meta cleared, db recreated)");
+    println!(
+        "(reset) hard reset done (entries wiped, keystore removed, meta cleared, db recreated)"
+    );
     Ok(true)
 }
 
@@ -999,7 +1443,9 @@ pub fn debug_check_no_aes_in_meta(db: State<AppDb>) -> Result<NoAesInMeta, Strin
             found.push(k.to_string());
         }
     }
-    Ok(NoAesInMeta { suspicious_keys_found: found })
+    Ok(NoAesInMeta {
+        suspicious_keys_found: found,
+    })
 }
 
 // Step 5 self-test: re-derive and report booleans/lengths (RAM-only)
@@ -1018,18 +1464,22 @@ pub struct HkdfStep5ZeroizeDemo {
 #[command]
 pub fn debug_hkdf_step5_zeroize_demo(
     db: State<AppDb>,
-    master_password: String
+    master_password: String,
 ) -> Result<HkdfStep5ZeroizeDemo, String> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let salt_pw_b64: String = conn.query_row(
-        "SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get(0)
-    ).map_err(|_| "salt_pw missing")?;
-    let salt_kdf_b64: String = conn.query_row(
-        "SELECT value FROM meta WHERE key='salt_kdf'", [], |r| r.get(0)
-    ).map_err(|_| "salt_kdf missing")?;
+    let salt_pw_b64: String = conn
+        .query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| "salt_pw missing")?;
+    let salt_kdf_b64: String = conn
+        .query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| "salt_kdf missing")?;
 
     let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode")?;
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
@@ -1052,7 +1502,8 @@ pub fn debug_hkdf_step5_zeroize_demo(
 
     let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
     let mut aes_key = [0u8; 32];
-    hk.expand(b"vault-key", &mut aes_key).map_err(|_| "HKDF expand")?;
+    hk.expand(b"vault-key", &mut aes_key)
+        .map_err(|_| "HKDF expand")?;
 
     let k1_before_b64 = B64.encode(&k1);
     let ss_before_b64 = B64.encode(&ss_raw);
@@ -1084,7 +1535,6 @@ pub fn debug_hkdf_step5_zeroize_demo(
     })
 }
 
-
 #[command]
 pub fn debug_delete_device_key() -> Result<bool, String> {
     match keystore_path() {
@@ -1101,8 +1551,6 @@ pub fn debug_delete_device_key() -> Result<bool, String> {
         Err(e) => Err(format!("keystore_path error: {e}")),
     }
 }
-
-
 
 // Print/Assert zeroize demo
 #[derive(serde::Serialize)]
@@ -1128,24 +1576,34 @@ fn count_nonzero(bytes: &[u8]) -> usize {
 fn hex4(bytes: &[u8]) -> String {
     let take = bytes.iter().take(4);
     let mut s = String::new();
-    for b in take { use std::fmt::Write; let _ = write!(s, "{:02x}", b); }
+    for b in take {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
     s
 }
 
 #[command]
-pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> Result<ZeroizePrintResult, String> {
+pub fn debug_step5_zeroize_print(
+    db: State<AppDb>,
+    master_password: String,
+) -> Result<ZeroizePrintResult, String> {
     use hkdf::Hkdf;
     use sha2::Sha256;
 
     println!("== debug_step5_zeroize_print ==");
 
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let salt_pw_b64: String = conn.query_row(
-        "SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get(0)
-    ).map_err(|_| "salt_pw missing")?;
-    let salt_kdf_b64: String = conn.query_row(
-        "SELECT value FROM meta WHERE key='salt_kdf'", [], |r| r.get(0)
-    ).map_err(|_| "salt_kdf missing")?;
+    let salt_pw_b64: String = conn
+        .query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| "salt_pw missing")?;
+    let salt_kdf_b64: String = conn
+        .query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| {
+            r.get(0)
+        })
+        .map_err(|_| "salt_kdf missing")?;
 
     let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode")?;
     let salt_kdf = B64.decode(&salt_kdf_b64).map_err(|_| "salt_kdf decode")?;
@@ -1168,16 +1626,34 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
 
     let hk = Hkdf::<Sha256>::new(Some(&salt_kdf), &ikm);
     let mut aes_key = [0u8; 32];
-    hk.expand(b"vault-key", &mut aes_key).map_err(|_| "HKDF expand failed")?;
+    hk.expand(b"vault-key", &mut aes_key)
+        .map_err(|_| "HKDF expand failed")?;
 
-    let k1_nonzero_before  = count_nonzero(&k1);
-    let ss_nonzero_before  = count_nonzero(&ss_raw);
+    let k1_nonzero_before = count_nonzero(&k1);
+    let ss_nonzero_before = count_nonzero(&ss_raw);
     let ikm_nonzero_before = count_nonzero(&ikm);
     let aes_nonzero_before = count_nonzero(&aes_key);
-    println!("[before] K1: len=32 nonzero={} preview={}..", k1_nonzero_before, hex4(&k1));
-    println!("[before] SS: len={} nonzero={} preview={}..", ss_raw.len(), ss_nonzero_before, hex4(&ss_raw));
-    println!("[before] IKM: len={} nonzero={}", ikm.len(), ikm_nonzero_before);
-    println!("[before] AES: len=32 nonzero={} preview={}..", aes_nonzero_before, hex4(&aes_key));
+    println!(
+        "[before] K1: len=32 nonzero={} preview={}..",
+        k1_nonzero_before,
+        hex4(&k1)
+    );
+    println!(
+        "[before] SS: len={} nonzero={} preview={}..",
+        ss_raw.len(),
+        ss_nonzero_before,
+        hex4(&ss_raw)
+    );
+    println!(
+        "[before] IKM: len={} nonzero={}",
+        ikm.len(),
+        ikm_nonzero_before
+    );
+    println!(
+        "[before] AES: len=32 nonzero={} preview={}..",
+        aes_nonzero_before,
+        hex4(&aes_key)
+    );
 
     k1.zeroize();
     let mut ss_mut = ss_raw.clone();
@@ -1185,8 +1661,8 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
     ikm.zeroize();
     aes_key.zeroize();
 
-    let k1_zeroized  = k1.iter().all(|&b| b == 0);
-    let ss_zeroized  = ss_mut.iter().all(|&b| b == 0);
+    let k1_zeroized = k1.iter().all(|&b| b == 0);
+    let ss_zeroized = ss_mut.iter().all(|&b| b == 0);
     let ikm_zeroized = ikm.iter().all(|&b| b == 0);
     let aes_zeroized = aes_key.iter().all(|&b| b == 0);
 
@@ -1217,23 +1693,39 @@ pub fn debug_step5_zeroize_print(db: State<AppDb>, master_password: String) -> R
 
 // Step 6/7 debug helpers
 #[derive(serde::Serialize)]
-pub struct VaultKeyStatus { pub loaded: bool }
+pub struct VaultKeyStatus {
+    pub loaded: bool,
+}
 
 #[command]
 pub fn debug_vault_key_status() -> Result<VaultKeyStatus, String> {
     let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
-    Ok(VaultKeyStatus { loaded: guard.is_some() })
+    Ok(VaultKeyStatus {
+        loaded: guard.is_some(),
+    })
 }
 
 #[derive(serde::Serialize)]
-pub struct DbPathInfo { pub path: String, pub exists: bool, pub size: Option<u64> }
+pub struct DbPathInfo {
+    pub path: String,
+    pub exists: bool,
+    pub size: Option<u64>,
+}
 
 #[command]
 pub fn debug_db_path(app: AppHandle) -> Result<DbPathInfo, String> {
     let p = crate::vault_core::db::db_path(&app);
     let exists = p.exists();
-    let size = if exists { fs::metadata(&p).ok().map(|m| m.len()) } else { None };
-    Ok(DbPathInfo { path: p.to_string_lossy().to_string(), exists, size })
+    let size = if exists {
+        fs::metadata(&p).ok().map(|m| m.len())
+    } else {
+        None
+    };
+    Ok(DbPathInfo {
+        path: p.to_string_lossy().to_string(),
+        exists,
+        size,
+    })
 }
 // command to list tables & schemas
 #[derive(serde::Serialize)]
@@ -1249,7 +1741,7 @@ pub struct ColumnInfo {
 #[derive(serde::Serialize)]
 pub struct TableSchema {
     pub name: String,
-    pub sql: Option<String>,         // CREATE TABLE ... (may be None for internal tables)
+    pub sql: Option<String>, // CREATE TABLE ... (may be None for internal tables)
     pub columns: Vec<ColumnInfo>,
 }
 
@@ -1310,10 +1802,7 @@ pub fn debug_list_schema(db: State<AppDb>) -> Result<Vec<TableSchema>, String> {
 
 #[command]
 pub fn debug_aes_key_exists() -> bool {
-    VAULT_AES_KEY
-        .read()
-        .map(|g| g.is_some())
-        .unwrap_or(false)
+    VAULT_AES_KEY.read().map(|g| g.is_some()).unwrap_or(false)
 }
 
 #[command]
@@ -1360,11 +1849,9 @@ pub fn debug_decapsulate_status(db: State<AppDb>) -> Result<DecapStatus, String>
     let ct_kem_len = {
         let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
         let ct_b64: Option<String> = conn
-            .query_row(
-                "SELECT value FROM meta WHERE key='ct_kem'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
+            .query_row("SELECT value FROM meta WHERE key='ct_kem'", [], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()
             .map_err(|e| e.to_string())?;
         match ct_b64 {
@@ -1408,13 +1895,21 @@ pub struct EntryBlobInfo {
 }
 fn hex(bytes: &[u8], max: usize) -> String {
     let mut s = String::new();
-    for b in bytes.iter().take(max) { use std::fmt::Write; let _ = write!(s, "{:02x}", b); }
+    for b in bytes.iter().take(max) {
+        use std::fmt::Write;
+        let _ = write!(s, "{:02x}", b);
+    }
     s
 }
 // Checks if text is readable and therefore not encrypted
 fn mostly_printable(bytes: &[u8]) -> bool {
-    if bytes.is_empty() { return false; }
-    let printable = bytes.iter().filter(|&&b| (b >= 0x20 && b <= 0x7e) || b == b'\n').count();
+    if bytes.is_empty() {
+        return false;
+    }
+    let printable = bytes
+        .iter()
+        .filter(|&&b| (b >= 0x20 && b <= 0x7e) || b == b'\n')
+        .count();
     (printable as f32) / (bytes.len() as f32) > 0.9
 }
 
@@ -1422,11 +1917,13 @@ fn mostly_printable(bytes: &[u8]) -> bool {
 #[command]
 pub fn debug_entry_blob_info(db: State<AppDb>, id: i64) -> Result<EntryBlobInfo, String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let (nonce, ct, tag): (Vec<u8>, Vec<u8>, Vec<u8>) = conn.query_row(
-        "SELECT nonce, ciphertext, tag FROM entries WHERE id=?1",
-        rusqlite::params![id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-    ).map_err(|e| e.to_string())?;
+    let (nonce, ct, tag): (Vec<u8>, Vec<u8>, Vec<u8>) = conn
+        .query_row(
+            "SELECT nonce, ciphertext, tag FROM entries WHERE id=?1",
+            rusqlite::params![id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|e| e.to_string())?;
     Ok(EntryBlobInfo {
         id,
         nonce_len: nonce.len(),
@@ -1443,38 +1940,48 @@ pub fn debug_entry_blob_info(db: State<AppDb>, id: i64) -> Result<EntryBlobInfo,
 pub fn debug_tamper_entry(
     db: State<AppDb>,
     id: i64,
-    field: String,        
-    index: Option<i64>,   // flips byte 0 by default
-    xor: u8               // bit mask
+    field: String,
+    index: Option<i64>, // flips byte 0 by default
+    xor: u8,            // bit mask
 ) -> Result<usize, String> {
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let col = match field.as_str() {    // which columns to corrupt
+    let col = match field.as_str() {
+        // which columns to corrupt
         "ciphertext" => "ciphertext",
         "tag" => "tag",
         "nonce" => "nonce",
         other => return Err(format!("unknown field: {}", other)),
     };
-    let mut blob: Vec<u8> = conn.query_row(
-        &format!("SELECT {} FROM entries WHERE id=?1", col),
-        rusqlite::params![id],
-        |r| r.get(0)
-    ).map_err(|e| e.to_string())?;
-    if blob.is_empty() { return Err("blob empty".into()); }
+    let mut blob: Vec<u8> = conn
+        .query_row(
+            &format!("SELECT {} FROM entries WHERE id=?1", col),
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if blob.is_empty() {
+        return Err("blob empty".into());
+    }
     let i = index.unwrap_or(0) as usize;
-    if i >= blob.len() { return Err(format!("index {} out of range {}", i, blob.len())); }
+    if i >= blob.len() {
+        return Err(format!("index {} out of range {}", i, blob.len()));
+    }
     blob[i] ^= xor;
-    let n = conn.execute(
-        &format!("UPDATE entries SET {}=?1 WHERE id=?2", col),
-        rusqlite::params![blob, id]
-    ).map_err(|e| e.to_string())?;
+    let n = conn
+        .execute(
+            &format!("UPDATE entries SET {}=?1 WHERE id=?2", col),
+            rusqlite::params![blob, id],
+        )
+        .map_err(|e| e.to_string())?;
     Ok(n)
 }
 
 #[derive(serde::Serialize)]
-pub struct CryptoSelfTest { 
-    pub nonce_len: usize, 
-    pub tag_len: usize, 
-    pub roundtrip_ok: bool }
+pub struct CryptoSelfTest {
+    pub nonce_len: usize,
+    pub tag_len: usize,
+    pub roundtrip_ok: bool,
+}
 
 #[command]
 pub fn debug_crypto_selftest(pt: String) -> Result<CryptoSelfTest, String> {
@@ -1490,28 +1997,39 @@ pub fn debug_crypto_selftest(pt: String) -> Result<CryptoSelfTest, String> {
     })
 }
 
-
 // =========================
 // Vault CRUD (placeholder crypto for now)
 // =========================
 
 fn validate_label(label: &str) -> Result<String, String> {
     let trimmed_label = label.trim();
-    if trimmed_label.is_empty() { return Err("Label is required".into()); }
-    if trimmed_label.len() > 128 { return Err("Label is too long (max 128)".into()); }
+    if trimmed_label.is_empty() {
+        return Err("Label is required".into());
+    }
+    if trimmed_label.len() > 128 {
+        return Err("Label is too long (max 128)".into());
+    }
     Ok(trimmed_label.to_string())
 }
 
 fn validate_username(username: &str) -> Result<String, String> {
     let trimmed_username = username.trim();
-    if trimmed_username.is_empty() { return Err("Username is required".into()); }
-    if trimmed_username.len() > 256 { return Err("Username is too long (max 256)".into()); }
+    if trimmed_username.is_empty() {
+        return Err("Username is required".into());
+    }
+    if trimmed_username.len() > 256 {
+        return Err("Username is too long (max 256)".into());
+    }
     Ok(trimmed_username.to_string())
 }
 
 fn validate_password(password: String) -> Result<SecretString, String> {
-    if password.is_empty() { return Err("Password is required".into()); }
-    if password.len() > 10000 { return Err("Password is too long".into()); }
+    if password.is_empty() {
+        return Err("Password is required".into());
+    }
+    if password.len() > 10000 {
+        return Err("Password is too long".into());
+    }
     Ok(SecretString::from(password))
 }
 
@@ -1550,7 +2068,7 @@ pub fn vault_add(
     let password = validate_password(password)?;
     let notes = validate_notes(&notes)?;
 
-    // Uses VAULT_AES_KEY by reference 
+    // Uses VAULT_AES_KEY by reference
     let sealed = {
         let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
         let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
@@ -1583,8 +2101,10 @@ pub fn vault_get(db: State<AppDb>, id: i64) -> Result<String, String> {
     if enc.nonce.len() != 12 || enc.tag.len() != 16 {
         return Err("Entry is corrupt (invalid nonce/tag size)".into());
     }
-    let mut nonce12 = [0u8; 12];  nonce12.copy_from_slice(&enc.nonce);
-    let mut tag16   = [0u8; 16];  tag16.copy_from_slice(&enc.tag);
+    let mut nonce12 = [0u8; 12];
+    nonce12.copy_from_slice(&enc.nonce);
+    let mut tag16 = [0u8; 16];
+    tag16.copy_from_slice(&enc.tag);
 
     // VAULT_AES_KEY passed by reference
     let plaintext = {
@@ -1614,7 +2134,6 @@ pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
     }
 }
 
-
 // For windows, prevents password from staying in clipboard history
 #[tauri::command]
 #[cfg(target_os = "windows")]
@@ -1624,7 +2143,11 @@ pub fn copy_to_clipboard_no_history(text: &str) -> Result<(), String> {
         // makes sure clipboard will be closed when _guard goes out of scope
         struct Close;
         impl Drop for Close {
-            fn drop(&mut self) { unsafe { let _ = CloseClipboard(); } }
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = CloseClipboard();
+                }
+            }
         }
         let _guard = Close;
         // clear existing clipboard
@@ -1641,18 +2164,15 @@ pub fn copy_to_clipboard_no_history(text: &str) -> Result<(), String> {
         if p.is_null() {
             return Err("GlobalLock(text) failed".into());
         }
-        std::ptr::copy_nonoverlapping(
-            utf16.as_ptr() as *const u8,
-            p as *mut u8,
-            byte_len,
-        );
+        std::ptr::copy_nonoverlapping(utf16.as_ptr() as *const u8, p as *mut u8, byte_len);
         GlobalUnlock(h_text);
         // puts text in clipboard
         if let Err(e) = SetClipboardData(CF_UNICODETEXT, HANDLE(h_text.0)) {
             return Err(format!("SetClipboardData(CF_UNICODETEXT) failed: {e}"));
         }
         // prevent windows from storing in clipboard history
-        let fmt_exclude = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
+        let fmt_exclude =
+            RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
         if fmt_exclude == 0 {
             return Err("RegisterClipboardFormatW(exclude) failed".into());
         }
@@ -1672,7 +2192,9 @@ pub fn copy_to_clipboard_no_history(text: &str) -> Result<(), String> {
 pub fn copy_to_clipboard(text: String) -> Result<(), String> {
     let secret_text = SecretString::from(text);
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
-    clipboard.set_text(secret_text.expose_secret()).map_err(|e| e.to_string())?;
+    clipboard
+        .set_text(secret_text.expose_secret())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1684,7 +2206,6 @@ pub fn get_clipboard_text() -> Result<String, String> {
     Ok(out)
 }
 
-
 /// DEV ONLY: Insert a known-corrupted entry (same values every time).
 /// Always returns the inserted entry id.
 /// Intended to trigger AES-GCM decrypt failure in `vault_get`.
@@ -1695,16 +2216,12 @@ pub fn debug_insert_bad_entry(db: State<AppDb>) -> Result<i64, String> {
 
     // Known wrong nonce + tag + ciphertext (invalid AES-GCM)
     let nonce: [u8; 12] = [
-        0xDE, 0xAD, 0xBE, 0xEF,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
+        0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
     let tag: [u8; 16] = [
-        0xBA, 0xAD, 0xF0, 0x0D,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00,
+        0xBA, 0xAD, 0xF0, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00,
     ];
 
     let ciphertext: Vec<u8> = vec![0x00, 0x11, 0x22, 0x33];
@@ -1718,8 +2235,7 @@ pub fn debug_insert_bad_entry(db: State<AppDb>) -> Result<i64, String> {
         tag: &tag,
     };
 
-    let inserted = crate::vault_core::db::add_entry(&conn, new)
-        .map_err(|e| e.to_string())?;
+    let inserted = crate::vault_core::db::add_entry(&conn, new).map_err(|e| e.to_string())?;
 
     println!("[debug] inserted corrupted entry id={} ✅", inserted.id);
 
@@ -1742,7 +2258,11 @@ pub fn debug_corrupt_manifest(db: State<AppDb>) -> Result<bool, String> {
 
     // read original value
     let original_value: String = conn
-        .query_row("SELECT value FROM meta WHERE key=?1", [key_to_corrupt], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM meta WHERE key=?1",
+            [key_to_corrupt],
+            |r| r.get(0),
+        )
         .map_err(|_| format!("missing meta key: {key_to_corrupt}"))?;
 
     // mutate a single random character to simulate tampering
@@ -1769,27 +2289,29 @@ pub fn debug_corrupt_manifest(db: State<AppDb>) -> Result<bool, String> {
     Ok(true)
 }
 
-
-
-
-
-
 #[tauri::command]
 pub fn setup_verifier(db: State<AppDb>, password: String) -> Result<(), String> {
-    use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, OsRng, rand_core::RngCore}};
+    use aes_gcm::{
+        aead::{rand_core::RngCore, Aead, OsRng},
+        Aes256Gcm, KeyInit,
+    };
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use sha2::Sha256;
     use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha256;
 
     // Get salt_pw from DB
     let salt_pw_b64: String = {
         let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-        conn.query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| r.get::<_, String>(0))
-            .map_err(|_| "missing salt_pw")?
+        conn.query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .map_err(|_| "missing salt_pw")?
     };
 
     // Decode salt and derive K1
-    let salt_pw = B64.decode(&salt_pw_b64).map_err(|_| "salt_pw decode failed")?;
+    let salt_pw = B64
+        .decode(&salt_pw_b64)
+        .map_err(|_| "salt_pw decode failed")?;
     let mut k1 = [0u8; 32];
     pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_pw, 310_000, &mut k1);
 
@@ -1798,22 +2320,25 @@ pub fn setup_verifier(db: State<AppDb>, password: String) -> Result<(), String> 
     let cipher = Aes256Gcm::new_from_slice(&k1).unwrap();
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
-    let verifier_ct = cipher.encrypt(&nonce.into(), verifier_plain.as_ref()).unwrap();
+    let verifier_ct = cipher
+        .encrypt(&nonce.into(), verifier_plain.as_ref())
+        .unwrap();
 
     // Store verifier in meta
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('verifier_nonce', ?1)",
         [B64.encode(&nonce)],
-    ).map_err(|_| "insert verifier_nonce failed")?;
+    )
+    .map_err(|_| "insert verifier_nonce failed")?;
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES ('verifier_ct', ?1)",
         [B64.encode(&verifier_ct)],
-    ).map_err(|_| "insert verifier_ct failed")?;
+    )
+    .map_err(|_| "insert verifier_ct failed")?;
 
     Ok(())
 }
-
 
 // Unit tests for zeroization logic
 // These unit tests are inside commands.rs so they can directly test private helpers
@@ -1823,14 +2348,14 @@ pub fn setup_verifier(db: State<AppDb>, password: String) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeroize::Zeroize;
     use std::{thread, time::Duration};
+    use zeroize::Zeroize;
 
     // 1) Unit Test if wipe_secret() actually overwrites the buffer with zeros
     #[test]
     fn wipe_secret_overwrites_buffer() {
         let mut buf = [0xAAu8; 16]; // fill buffer with non-zero values
-        wipe_secret(&mut buf);      // run our secure wipe helper
+        wipe_secret(&mut buf); // run our secure wipe helper
         assert!(buf.iter().all(|&b| b == 0)); // all bytes should now be zero
 
         // what this test checks:
@@ -1882,23 +2407,21 @@ mod tests {
         // - wiping them helps protect against someone reading RAM snapshots
     }
 
-
     // 4) Unit Test that plaintext passwords get wiped after we’re done using them
     #[test]
     fn password_string_zeroized_after_use() {
         let password = String::from("Tr0ub4dor&3"); // fake password input
-        let mut pw_bytes = password.into_bytes();   // convert to bytes like vault_add does
-        assert!(pw_bytes.iter().any(|&b| b != 0));  // sanity check, not all zero yet
+        let mut pw_bytes = password.into_bytes(); // convert to bytes like vault_add does
+        assert!(pw_bytes.iter().any(|&b| b != 0)); // sanity check, not all zero yet
 
-        wipe_secret(&mut pw_bytes);                 // wipe it right after "encrypting"
-        assert!(pw_bytes.iter().all(|&b| b == 0));  // confirm every byte is zero
+        wipe_secret(&mut pw_bytes); // wipe it right after "encrypting"
+        assert!(pw_bytes.iter().all(|&b| b == 0)); // confirm every byte is zero
 
         // what this test checks:
         // - makes sure plaintext passwords are erased as soon as we’re done with them
         // - prevents leftover password text from sitting in RAM after encryption
         // - helps protect against forensic memory scans or crash dumps
     }
-
 
     // 5) Unit Test our clipboard timer logic (mocked version)
     #[test]
@@ -1914,19 +2437,16 @@ mod tests {
         thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
             *clip_ref.lock().unwrap() = String::new(); // simulate clearing
-        });fn get_aes_key() -> Result<[u8; 32], &'static str> {
-    use core::convert::TryInto;
+        });
+        fn get_aes_key() -> Result<[u8; 32], &'static str> {
+            use core::convert::TryInto;
 
-    let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
-    guard
-        .as_ref()
-        .ok_or("vault locked")
-        .map(|key| {
-            let slice: &[u8] = key.as_ref();            // &Zeroizing<[u8;32]> → &[u8]
-            slice.try_into().expect("AES key wrong length") // &[u8] → [u8;32]
-        })
-}
-
+            let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
+            guard.as_ref().ok_or("vault locked").map(|key| {
+                let slice: &[u8] = key.as_ref(); // &Zeroizing<[u8;32]> → &[u8]
+                slice.try_into().expect("AES key wrong length") // &[u8] → [u8;32]
+            })
+        }
 
         // right after copying, clipboard should still hold the secret
         assert_eq!(&*clip.lock().unwrap(), "secret123");
@@ -1941,16 +2461,15 @@ mod tests {
         // - prevents passwords from sticking around in clipboard memory
     }
 
-
     // 6) Unit Test that wiping twice doesn’t break anything (edge-case)
     #[test]
     fn repeated_aes_key_wipe_safe() {
         let key = [0xCDu8; 32];
         install_aes_key(&key).expect("install"); // put key in memory
-        zeroize_aes_key().expect("wipe #1");     // first wipe
-        zeroize_aes_key().expect("wipe #2");     // second wipe (should do nothing bad)
+        zeroize_aes_key().expect("wipe #1"); // first wipe
+        zeroize_aes_key().expect("wipe #2"); // second wipe (should do nothing bad)
         let guard = VAULT_AES_KEY.read().unwrap();
-        assert!(guard.is_none());                // still wiped and safe
+        assert!(guard.is_none()); // still wiped and safe
 
         // what this test checks:
         // - verifies we can call the wipe function multiple times safely
@@ -1958,4 +2477,3 @@ mod tests {
         // - ensures wiping is “best effort” and can’t panic if key’s already gone
     }
 }
-
