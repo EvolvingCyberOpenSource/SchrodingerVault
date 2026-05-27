@@ -45,12 +45,12 @@ passwordForm.addEventListener("submit", async (e) => {
 
   const password = document.querySelector("#masterPassword").value;
   const confirm_Password = document.querySelector("#confirmPassword").value;
+  const kdf = document.querySelector('input[name="kdf"]:checked')?.value ?? "argon2id";
 
   if (!validatePassword(password, confirm_Password)) return;
 
   try {
-    // IMPORTANT: arg name must be snake_case to match Rust signature
-    await invoke("create_vault", { masterPassword: password });
+    await invoke("create_vault", { masterPassword: password, kdf });
     window.location.replace("index.html");
   } catch (e) {
     console.error(e);

@@ -5,10 +5,6 @@ const { ask } = window.__TAURI__.dialog;
 const PASS_VIS_DURATION = 10000; // Time till password is hidden (10s)
 const BULLETS = "••••••••";
 
-// single clipboard timer and owner token
-let clipboardClearTimer = null;
-let clipboardOwnerToken = 0;
-
 // Idle timeout auto-lock timer
 const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 mins
 let idleTimer = null;
@@ -83,62 +79,20 @@ function showToast(message, duration = 3000) {
 
 }
 
-// --- Copy password helper for windows ---
-async function copyPasswordNoHistory(text) {
-    // Try windows no-history copy first
-    try {
-        await window.__TAURI__.core.invoke("copy_to_clipboard_no_history", { text });
-        return;
-    } catch (e) {
-        // If not on windows, fall back
-        // console.debug("no-history copy unavailable, using standard copy:", e);
-    }
-    await window.__TAURI__.core.invoke("copy_to_clipboard", { text });
-}
-
 // --- Copy password ---
 async function copyPassword(id) {
+    let value = null;
     try {
-        const value = await invoke("vault_get", { id });
-        try {
-            // await invoke("copy_to_clipboard", { text: value }); // old way
-            await copyPasswordNoHistory(value);
-            showToast("Copied");
-            console.log("copy to clipboard successful");
-        } catch (e) {
-            console.error('Failed to copy:', e);
-            return;
-        }
-        // 
-        const myToken = ++clipboardOwnerToken;
-
-        // cancel any old timers for existing copy action
-        if (clipboardClearTimer) {
-            clearTimeout(clipboardClearTimer);
-            clipboardClearTimer = null;
-        }
-        // start countdown for latest copy
-        clipboardClearTimer = setTimeout(async() => {
-            // verify still latest copy 
-            if (myToken !== clipboardOwnerToken) return;
-
-            try {
-                const current_clipboard = await invoke("get_clipboard_text");
-                if (current_clipboard === value) {
-                    // await invoke("copy_to_clipboard", { text: "" }); // old way
-                    await copyPasswordNoHistory("");
-                    showToast("Clipboard cleared");
-                }
-            } catch (err) {
-                console.log("Clipboard read/clear error:", err);
-            } finally {
-                if (myToken === clipboardOwnerToken) {
-                    clipboardClearTimer = null;
-                }
-            }
-        }, PASS_VIS_DURATION);
+        value = await invoke("vault_get", { id });
+        await invoke("copy_secret_to_clipboard", {
+            text: value,
+            clearAfterMs: PASS_VIS_DURATION,
+        });
+        showToast("Copied");
     } catch (err) {
         console.log("Copy failed:", err);
+    } finally {
+        value = null;
     }
 }
 
@@ -156,6 +110,98 @@ async function deleteEntry(id, row, label) {
         console.log("JS done with deleteEntry: ", id)
     } catch (err) {
         console.log("Delete failed:", err);
+    }
+}
+
+function setupEditEntryDialog() {
+    const dialog = document.getElementById("edit-entry-dialog");
+    const form = document.getElementById("edit-entry-form");
+    const cancelBtn = document.getElementById("cancel-edit-entry");
+    const submitBtn = document.getElementById("submit-edit-entry");
+    const labelInput = document.getElementById("edit-entry-label");
+    const usernameInput = document.getElementById("edit-entry-username");
+    const passwordInput = document.getElementById("edit-entry-password");
+    const notesInput = document.getElementById("edit-entry-notes");
+    const msg = document.getElementById("edit-entry-msg");
+
+    if (!dialog || !form) return;
+
+    const clearForm = () => {
+        form.reset();
+        form.dataset.entryId = "";
+        msg.textContent = "";
+        passwordInput.value = "";
+    };
+
+    cancelBtn.addEventListener("click", () => {
+        clearForm();
+        dialog.close();
+    });
+
+    dialog.addEventListener("close", () => {
+        passwordInput.value = "";
+    });
+
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        msg.textContent = "";
+
+        const id = Number(form.dataset.entryId);
+        const label = labelInput.value;
+        const username = usernameInput.value;
+        let password = passwordInput.value;
+        const notesRaw = notesInput.value;
+        const notes = notesRaw.trim().length ? notesRaw : null;
+
+        if (!id) {
+            msg.textContent = "No entry selected.";
+            return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Saving...";
+        try {
+            await invoke("vault_update", { id, label, username, password, notes });
+            clearForm();
+            dialog.close();
+            await loadEntries();
+            showToast("Entry updated");
+        } catch (err) {
+            console.error("Entry update failed:", err);
+            msg.textContent = String(err);
+        } finally {
+            password = null;
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Save";
+        }
+    });
+}
+
+async function openEditEntry(entry) {
+    const dialog = document.getElementById("edit-entry-dialog");
+    const form = document.getElementById("edit-entry-form");
+    const labelInput = document.getElementById("edit-entry-label");
+    const usernameInput = document.getElementById("edit-entry-username");
+    const passwordInput = document.getElementById("edit-entry-password");
+    const notesInput = document.getElementById("edit-entry-notes");
+    const msg = document.getElementById("edit-entry-msg");
+
+    if (!dialog || !form) return;
+
+    msg.textContent = "";
+    form.dataset.entryId = String(entry.id);
+    labelInput.value = entry.label;
+    usernameInput.value = entry.username;
+    notesInput.value = entry.notes || "";
+    passwordInput.value = "";
+    dialog.showModal();
+    labelInput.focus();
+
+    try {
+        passwordInput.value = await invoke("vault_get", { id: entry.id });
+    } catch (err) {
+        console.error("Loading entry password failed:", err);
+        msg.textContent = String(err);
     }
 }
 
@@ -315,6 +361,93 @@ function setupFactoryResetDialog() {
     });
 }
 
+async function refreshKeyDerivationStatus() {
+    const label = document.getElementById("current-kdf-label");
+    const button = document.getElementById("change-kdf-btn");
+    if (!label) return;
+
+    try {
+        const status = await invoke("key_derivation_status");
+        label.textContent = status.label;
+        label.dataset.kdf = status.kdf;
+        if (button) button.disabled = false;
+    } catch (err) {
+        console.error("Key derivation status failed:", err);
+        label.textContent = "Unavailable";
+        if (button) button.disabled = true;
+    }
+}
+
+function setupKeyDerivationDialog() {
+    const openBtn = document.getElementById("change-kdf-btn");
+    const dialog = document.getElementById("change-kdf-dialog");
+    const form = document.getElementById("change-kdf-form");
+    const cancelBtn = document.getElementById("cancel-change-kdf");
+    const submitBtn = document.getElementById("submit-change-kdf");
+    const passwordEl = document.getElementById("kdf-master-password");
+    const msg = document.getElementById("change-kdf-msg");
+    const currentLabel = document.getElementById("current-kdf-label");
+
+    if (!openBtn || !dialog || !form) return;
+
+    passwordEl.addEventListener("keydown", (event) => {
+        if (event.key !== "Enter") return;
+        event.preventDefault();
+        form.requestSubmit();
+    });
+
+    const clearForm = () => {
+        form.reset();
+        msg.textContent = "";
+        const currentKdf = currentLabel?.dataset.kdf ?? "argon2id";
+        const currentRadio = form.querySelector(`input[name="settings-kdf"][value="${currentKdf}"]`);
+        if (currentRadio) currentRadio.checked = true;
+    };
+
+    openBtn.addEventListener("click", () => {
+        clearForm();
+        dialog.showModal();
+        passwordEl.focus();
+    });
+
+    cancelBtn.addEventListener("click", () => {
+        clearForm();
+        dialog.close();
+    });
+
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        msg.textContent = "";
+
+        const currentPassword = passwordEl.value;
+        const kdf = form.querySelector('input[name="settings-kdf"]:checked')?.value;
+        if (!currentPassword) {
+            msg.textContent = "Enter the current master password.";
+            return;
+        }
+        if (!kdf) {
+            msg.textContent = "Choose a key derivation mode.";
+            return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Updating...";
+        try {
+            await invoke("change_key_derivation_mode", { currentPassword, kdf });
+            clearForm();
+            dialog.close();
+            await refreshKeyDerivationStatus();
+            showToast("Key derivation mode updated");
+        } catch (err) {
+            console.error("Key derivation mode change failed:", err);
+            msg.textContent = String(err);
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Update Mode";
+        }
+    });
+}
+
 function setupTabs() {
     const tabButtons = document.querySelectorAll("[data-tab-target]");
     const panels = document.querySelectorAll(".tab-panel");
@@ -348,6 +481,7 @@ function renderRow(e) {
     showBtn.addEventListener('click', () => togglePassword(e.id, secretSpan, showBtn, errorMsg));
 
     row.querySelector('.copy').addEventListener('click', () => copyPassword(e.id));
+    row.querySelector('.edit').addEventListener('click', () => openEditEntry(e));
     row.querySelector('.delete').addEventListener('click', () => deleteEntry(e.id, row, e.label));
 
     return row;
@@ -443,6 +577,8 @@ window.addEventListener("DOMContentLoaded", async(e) => {
         lockBtn.addEventListener("click", lockVault);
     }
     setupChangePasswordDialog();
+    setupEditEntryDialog();
+    setupKeyDerivationDialog();
     setupFactoryResetDialog();
     setupTabs();
     const searchEl = document.getElementById("entry-search");
@@ -463,6 +599,7 @@ window.addEventListener("DOMContentLoaded", async(e) => {
         const { loaded } = await invoke("vault_session_status");
         if (!loaded) return window.location.replace("unlock.html");
 
+        await refreshKeyDerivationStatus();
         await loadEntries();
     } catch (err) {
         console.error("Init check failed:", err);

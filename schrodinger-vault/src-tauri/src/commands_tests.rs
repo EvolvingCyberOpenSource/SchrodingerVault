@@ -2,7 +2,11 @@ use super::*;
 use std::{thread, time::Duration};
 use zeroize::Zeroize;
 
-fn verifier_conn(password: &str) -> (Connection, SecretString) {
+fn verifier_conn_with_kdf(
+    password: &str,
+    kdf: &str,
+    kdf_params: &'static str,
+) -> (Connection, SecretString) {
     let conn = Connection::open_in_memory().expect("open in-memory db");
     conn.execute(
         "CREATE TABLE meta (
@@ -16,7 +20,7 @@ fn verifier_conn(password: &str) -> (Connection, SecretString) {
     let mut salt_pw = [0u8; 32];
     rng().fill_bytes(&mut salt_pw);
     let password = SecretString::from(password.to_string());
-    let k1 = derive_k1(&password, &salt_pw, 310_000);
+    let k1 = derive_k1_with_kdf(&password, &salt_pw, kdf, Some(kdf_params)).expect("derive k1");
 
     let cipher = Aes256Gcm::new_from_slice(&k1).expect("cipher init");
     let mut verifier_nonce = [0u8; 12];
@@ -30,9 +34,11 @@ fn verifier_conn(password: &str) -> (Connection, SecretString) {
         [B64.encode(salt_pw)],
     )
     .expect("insert salt_pw");
+    conn.execute("INSERT INTO meta (key, value) VALUES ('kdf', ?1)", [kdf])
+        .expect("insert kdf");
     conn.execute(
         "INSERT INTO meta (key, value) VALUES ('kdf_params', ?1)",
-        [r#"{"iterations":310000,"out":32,"algo":"sha256"}"#],
+        [kdf_params],
     )
     .expect("insert kdf_params");
     conn.execute(
@@ -47,6 +53,14 @@ fn verifier_conn(password: &str) -> (Connection, SecretString) {
     .expect("insert verifier_ct");
 
     (conn, password)
+}
+
+fn verifier_conn(password: &str) -> (Connection, SecretString) {
+    verifier_conn_with_kdf(
+        password,
+        "pbkdf2-hmac-sha256",
+        r#"{"iterations":310000,"out":32,"algo":"sha256"}"#,
+    )
 }
 
 #[test]
@@ -136,6 +150,39 @@ fn master_password_verifier_rejects_wrong_password() {
     let (conn, _) = verifier_conn("correct horse battery staple");
     let wrong_password = SecretString::from("wrong horse battery staple".to_string());
     assert!(verify_master_password(&conn, &wrong_password).is_err());
+}
+
+#[test]
+fn argon2id_master_password_verifier_accepts_correct_password() {
+    let (conn, password) = verifier_conn_with_kdf(
+        "correct horse battery staple",
+        "argon2id",
+        r#"{"memory_kib":64,"iterations":2,"parallelism":1,"out":32,"algo":"argon2id","version":19}"#,
+    );
+
+    assert!(verify_master_password(&conn, &password).is_ok());
+}
+
+#[test]
+fn argon2id_and_pbkdf2_derive_different_keys() {
+    let password = SecretString::from("correct horse battery staple".to_string());
+    let salt = [0xA5u8; 32];
+    let argon2_key = derive_k1_with_kdf(
+        &password,
+        &salt,
+        "argon2id",
+        Some(r#"{"memory_kib":64,"iterations":2,"parallelism":1,"out":32,"algo":"argon2id","version":19}"#),
+    )
+    .expect("derive argon2id key");
+    let pbkdf2_key = derive_k1_with_kdf(
+        &password,
+        &salt,
+        "pbkdf2-hmac-sha256",
+        Some(r#"{"iterations":310000,"out":32,"algo":"sha256"}"#),
+    )
+    .expect("derive pbkdf2 key");
+
+    assert_ne!(argon2_key, pbkdf2_key);
 }
 
 #[test]

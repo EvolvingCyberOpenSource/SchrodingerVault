@@ -79,6 +79,13 @@
                     </div>
                     <button id="change-password-btn" type="button" class="btn-secondary">Change Password</button>
                 </div>
+                <div class="settings-row">
+                    <div>
+                        <h3>Key Derivation Mode</h3>
+                        <p>Current mode: <span id="current-kdf-label">Loading...</span></p>
+                    </div>
+                    <button id="change-kdf-btn" type="button" class="btn-secondary">Change Mode</button>
+                </div>
                 <div class="settings-row danger-zone">
                     <div>
                         <h3>Reset Vault</h3>
@@ -106,6 +113,9 @@
         <button type="button" class="copy btn-accent icon-button" aria-label="Copy password" title="Copy password">
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>
         </button>
+        <button type="button" class="edit btn-secondary icon-button" aria-label="Edit entry" title="Edit entry">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"></path></svg>
+        </button>
         <button type="button" class="delete icon-button" aria-label="Delete entry" title="Delete entry">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path><path d="M10 11v5"></path><path d="M14 11v5"></path></svg>
         </button>
@@ -114,6 +124,21 @@
     <span class="errorMsg"></span>
   </div>
 </template>
+
+        <dialog id="edit-entry-dialog" class="vault-dialog">
+            <form id="edit-entry-form" method="dialog" autocomplete="off">
+                <h2>Edit Entry</h2>
+                <input id="edit-entry-label" name="edit-entry-label" placeholder="Label" required />
+                <input id="edit-entry-username" name="edit-entry-username" placeholder="Username" required />
+                <input id="edit-entry-password" name="edit-entry-password" type="password" placeholder="Password" required />
+                <textarea id="edit-entry-notes" name="edit-entry-notes" placeholder="Notes (optional)"></textarea>
+                <p id="edit-entry-msg" class="dialog-msg" aria-live="polite"></p>
+                <div class="dialog-actions">
+                    <button id="cancel-edit-entry" type="button" class="btn-secondary">Cancel</button>
+                    <button id="submit-edit-entry" type="submit" class="btn-accent">Save</button>
+                </div>
+            </form>
+        </dialog>
 
         <dialog id="change-password-dialog" class="vault-dialog">
             <form id="change-password-form" method="dialog" autocomplete="off">
@@ -126,6 +151,30 @@
                 <div class="dialog-actions">
                     <button id="cancel-change-password" type="button" class="btn-secondary">Cancel</button>
                     <button id="submit-change-password" type="submit" class="btn-accent">Update</button>
+                </div>
+            </form>
+        </dialog>
+
+        <dialog id="change-kdf-dialog" class="vault-dialog">
+            <form id="change-kdf-form" method="dialog" autocomplete="off">
+                <h2>Key Derivation Mode</h2>
+                <p class="dialog-copy">Changing mode re-encrypts saved entries. PBKDF2-HMAC-SHA256 is available for FIPS-aligned environments.</p>
+                <fieldset class="kdf-options" aria-label="Key derivation mode">
+                    <legend>Mode</legend>
+                    <label>
+                        <input type="radio" name="settings-kdf" value="argon2id" />
+                        <span>Argon2id</span>
+                    </label>
+                    <label>
+                        <input type="radio" name="settings-kdf" value="pbkdf2-hmac-sha256" />
+                        <span>PBKDF2</span>
+                    </label>
+                </fieldset>
+                <input id="kdf-master-password" name="kdf-master-password" type="password" placeholder="Current master password" required />
+                <p id="change-kdf-msg" class="dialog-msg" aria-live="polite"></p>
+                <div class="dialog-actions">
+                    <button id="cancel-change-kdf" type="button" class="btn-secondary">Cancel</button>
+                    <button id="submit-change-kdf" type="submit" class="btn-accent">Update Mode</button>
                 </div>
             </form>
         </dialog>

@@ -7,6 +7,9 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use rand::{rng, RngCore}; // rand 0.9: rng() + RngCore::fill_bytes (reserved for future nonce use)
 
+use argon2::{
+    Algorithm as Argon2Algorithm, Argon2, Params as Argon2Params, Version as Argon2Version,
+};
 use hkdf::Hkdf;
 use pbkdf2::pbkdf2_hmac;
 use sha2::Sha256;
@@ -230,6 +233,12 @@ pub struct VaultSessionStatus {
     pub loaded: bool,
 }
 
+#[derive(serde::Serialize)]
+pub struct KeyDerivationStatus {
+    pub kdf: String,
+    pub label: String,
+}
+
 #[command]
 pub fn vault_session_status() -> Result<VaultSessionStatus, String> {
     let guard = VAULT_AES_KEY.read().map_err(|_| "lock poisoned")?;
@@ -248,6 +257,7 @@ pub fn create_vault(
     _app: AppHandle,
     db: State<AppDb>,
     master_password: String,
+    kdf: Option<String>,
 ) -> Result<bool, String> {
     let master_password = SecretString::from(master_password);
 
@@ -285,19 +295,11 @@ pub fn create_vault(
     let salt_pw_b64 = B64.encode(salt_pw);
     let salt_kdf_b64 = B64.encode(salt_kdf);
 
-    // PBKDF2 params
-    let kdf = "pbkdf2-hmac-sha256";
-    let kdf_params = r#"{"iterations":310000,"out":32,"algo":"sha256"}"#;
+    let kdf_label = normalize_kdf_label(kdf.as_deref())?;
+    let kdf_params = default_kdf_params(kdf_label);
 
-    // PBKDF2 derive K1 (RAM only)
-    let iterations: u32 = 310_000;
-    let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(
-        master_password.expose_secret().as_bytes(),
-        &salt_pw,
-        iterations.into(),
-        &mut k1,
-    );
+    // Derive K1 (RAM only)
+    let mut k1 = derive_k1_with_kdf(&master_password, &salt_pw, kdf_label, Some(kdf_params))?;
 
     {
         use aes_gcm::{
@@ -379,7 +381,7 @@ pub fn create_vault(
         .map_err(|e| e.to_string())?;
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            (&"kdf", kdf),
+            (&"kdf", kdf_label),
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
@@ -405,10 +407,10 @@ pub fn create_vault(
         .map_err(|e| e.to_string())?;
 
         // algorithm label string for the vault (public)
-        let alg = "mlkem768|aes256gcm|hkdfsha256|pbkdf2";
+        let alg = format!("mlkem768|aes256gcm|hkdfsha256|{kdf_label}");
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES (?, ?)",
-            (&"alg", alg),
+            (&"alg", &alg),
         )
         .map_err(|e| e.to_string())?;
 
@@ -570,6 +572,69 @@ fn kdf_iterations(kdf_params_json: Option<String>) -> u32 {
         .unwrap_or(310_000)
 }
 
+fn normalize_kdf_label(kdf: Option<&str>) -> Result<&'static str, String> {
+    match kdf
+        .unwrap_or("argon2id")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "argon2id" | "argon2-id" => Ok("argon2id"),
+        "pbkdf2" | "pbkdf2-hmac-sha256" => Ok("pbkdf2-hmac-sha256"),
+        _ => Err("Unsupported key derivation function".into()),
+    }
+}
+
+fn default_kdf_params(kdf_label: &str) -> &'static str {
+    match kdf_label {
+        "argon2id" => {
+            r#"{"memory_kib":65536,"iterations":3,"parallelism":1,"out":32,"algo":"argon2id","version":19}"#
+        }
+        _ => r#"{"iterations":310000,"out":32,"algo":"sha256"}"#,
+    }
+}
+
+fn kdf_display_label(kdf_label: &str) -> &'static str {
+    match normalize_kdf_label(Some(kdf_label)).unwrap_or("pbkdf2-hmac-sha256") {
+        "argon2id" => "Argon2id",
+        _ => "PBKDF2-HMAC-SHA256 (FIPS-aligned)",
+    }
+}
+
+fn kdf_label_from_meta(kdf_label: Option<String>, kdf_params_json: Option<&str>) -> &'static str {
+    if let Some(label) = kdf_label {
+        if let Ok(normalized) = normalize_kdf_label(Some(&label)) {
+            return normalized;
+        }
+    }
+
+    kdf_params_json
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| {
+            v.get("algo")
+                .and_then(|algo| algo.as_str())
+                .and_then(|algo| normalize_kdf_label(Some(algo)).ok())
+        })
+        .unwrap_or("pbkdf2-hmac-sha256")
+}
+
+fn current_kdf(conn: &Connection) -> Result<&'static str, String> {
+    let kdf_label: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='kdf'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let kdf_params_json: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+
+    Ok(kdf_label_from_meta(kdf_label, kdf_params_json.as_deref()))
+}
+
 fn derive_k1(password: &SecretString, salt_pw: &[u8], iterations: u32) -> [u8; 32] {
     let mut k1 = [0u8; 32];
     pbkdf2_hmac::<Sha256>(
@@ -579,6 +644,55 @@ fn derive_k1(password: &SecretString, salt_pw: &[u8], iterations: u32) -> [u8; 3
         &mut k1,
     );
     k1
+}
+
+fn derive_k1_with_kdf(
+    password: &SecretString,
+    salt_pw: &[u8],
+    kdf_label: &str,
+    kdf_params_json: Option<&str>,
+) -> Result<[u8; 32], String> {
+    match normalize_kdf_label(Some(kdf_label))? {
+        "argon2id" => {
+            let params_json = kdf_params_json
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let memory_kib = params_json
+                .get("memory_kib")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(65_536) as u32;
+            let iterations = params_json
+                .get("iterations")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3) as u32;
+            let parallelism = params_json
+                .get("parallelism")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as u32;
+            let out_len = params_json
+                .get("out")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(32) as usize;
+
+            if out_len != 32 {
+                return Err("Unsupported Argon2id output length".into());
+            }
+
+            let params = Argon2Params::new(memory_kib, iterations, parallelism, Some(out_len))
+                .map_err(|e| format!("Argon2id params invalid: {e}"))?;
+            let argon2 = Argon2::new(Argon2Algorithm::Argon2id, Argon2Version::V0x13, params);
+            let mut k1 = [0u8; 32];
+            argon2
+                .hash_password_into(password.expose_secret().as_bytes(), salt_pw, &mut k1)
+                .map_err(|e| format!("Argon2id derivation failed: {e}"))?;
+            Ok(k1)
+        }
+        _ => Ok(derive_k1(
+            password,
+            salt_pw,
+            kdf_iterations(kdf_params_json.map(|s| s.to_string())),
+        )),
+    }
 }
 
 fn verify_k1(conn: &Connection, k1: &[u8; 32]) -> Result<(), String> {
@@ -643,12 +757,18 @@ fn verify_master_password(conn: &Connection, password: &SecretString) -> Result<
         })
         .optional()
         .map_err(|e| e.to_string())?;
+    let kdf_label: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key='kdf'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
 
     let salt_pw = B64
         .decode(&salt_pw_b64)
         .map_err(|_| "salt_pw decode failed")?;
-    let iterations = kdf_iterations(kdf_params_json);
-    let mut k1 = derive_k1(password, &salt_pw, iterations);
+    let label = kdf_label_from_meta(kdf_label, kdf_params_json.as_deref());
+    let mut k1 = derive_k1_with_kdf(password, &salt_pw, label, kdf_params_json.as_deref())?;
     let result = verify_k1(conn, &k1);
     k1.zeroize();
     result
@@ -683,7 +803,7 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
     let master_password = SecretString::from(password);
 
     // getting salt_pw and kdf info from meta table
-    let (salt_pw_b64, _kdf_label, kdf_params_json): (String, String, Option<String>) = {
+    let (salt_pw_b64, kdf_label, kdf_params_json): (String, Option<String>, Option<String>) = {
         let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
         let get = |k: &str| -> Result<String, String> {
             conn.query_row("SELECT value FROM meta WHERE key=?1", [k], |r| {
@@ -693,7 +813,11 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
         };
         (
             get("salt_pw")?,
-            get("kdf")?,
+            conn.query_row("SELECT value FROM meta WHERE key='kdf'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?,
             conn.query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| {
                 r.get::<_, String>(0)
             })
@@ -707,25 +831,14 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
         .decode(&salt_pw_b64)
         .map_err(|_| "salt_pw decode failed")?;
 
-    // getting num of pbdkf2 iterations (uses 310_000 as a default)
-    let iterations: u32 = kdf_params_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .and_then(|v| {
-            v.get("iterations")
-                .and_then(|i| i.as_u64())
-                .map(|n| n as u32)
-        })
-        .unwrap_or(310_000);
-
     // deriving k1
-    let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(
-        master_password.expose_secret().as_bytes(),
+    let label = kdf_label_from_meta(kdf_label, kdf_params_json.as_deref());
+    let mut k1 = derive_k1_with_kdf(
+        &master_password,
         &salt_pw,
-        iterations,
-        &mut k1,
-    );
+        label,
+        kdf_params_json.as_deref(),
+    )?;
 
     {
         use aes_gcm::aead::generic_array::GenericArray;
@@ -971,6 +1084,12 @@ pub fn change_master_password(
             })
             .optional()
             .map_err(|e| e.to_string())?;
+        let kdf_label_meta: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key='kdf'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
 
         let salt_pw = B64
             .decode(&salt_pw_b64)
@@ -978,9 +1097,14 @@ pub fn change_master_password(
         let salt_kdf = B64
             .decode(&salt_kdf_b64)
             .map_err(|_| "salt_kdf decode failed")?;
-        let iterations = kdf_iterations(kdf_params_json);
+        let kdf_label = kdf_label_from_meta(kdf_label_meta, kdf_params_json.as_deref());
 
-        old_k1 = derive_k1(&current_password, &salt_pw, iterations);
+        old_k1 = derive_k1_with_kdf(
+            &current_password,
+            &salt_pw,
+            kdf_label,
+            kdf_params_json.as_deref(),
+        )?;
         verify_k1(&conn, &old_k1)?;
         old_aes_key = derive_vault_key(&old_k1, &salt_kdf, &ss)?;
 
@@ -1022,7 +1146,12 @@ pub fn change_master_password(
         r.fill_bytes(&mut new_salt_pw);
         r.fill_bytes(&mut new_salt_kdf);
 
-        new_k1 = derive_k1(&new_password, &new_salt_pw, iterations);
+        new_k1 = derive_k1_with_kdf(
+            &new_password,
+            &new_salt_pw,
+            kdf_label,
+            kdf_params_json.as_deref(),
+        )?;
         new_aes_key = derive_vault_key(&new_k1, &new_salt_kdf, &ss)?;
 
         let cipher = Aes256Gcm::new_from_slice(&new_k1).map_err(|_| "cipher init failed")?;
@@ -1075,6 +1204,240 @@ pub fn change_master_password(
         tx.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('salt_kdf', ?1)",
             [&new_salt_kdf_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('verifier_nonce', ?1)",
+            [&verifier_nonce_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('verifier_ct', ?1)",
+            [&verifier_ct_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_hash', ?1)",
+            [&manifest_hash_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('manifest_sig', ?1)",
+            [&manifest_sig_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+
+        install_aes_key(&new_aes_key).map_err(|e| e.to_string())?;
+
+        new_salt_pw.zeroize();
+        new_salt_kdf.zeroize();
+        verifier_nonce.zeroize();
+        Ok(true)
+    })();
+
+    ss.zeroize();
+    old_k1.zeroize();
+    old_aes_key.zeroize();
+    new_k1.zeroize();
+    new_aes_key.zeroize();
+
+    result
+}
+
+#[command]
+pub fn key_derivation_status(db: State<AppDb>) -> Result<KeyDerivationStatus, String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let kdf = current_kdf(&conn)?.to_string();
+    Ok(KeyDerivationStatus {
+        label: kdf_display_label(&kdf).to_string(),
+        kdf,
+    })
+}
+
+#[command]
+pub fn change_key_derivation_mode(
+    db: State<AppDb>,
+    current_password: String,
+    kdf: String,
+) -> Result<bool, String> {
+    if current_password.is_empty() {
+        return Err("Current master password is required".into());
+    }
+
+    let target_kdf = normalize_kdf_label(Some(&kdf))?;
+    let current_password = SecretString::from(current_password);
+
+    let mut ss = recover_device_secret(&db)?;
+    let mut old_k1 = [0u8; 32];
+    let mut old_aes_key = [0u8; 32];
+    let mut new_k1 = [0u8; 32];
+    let mut new_aes_key = [0u8; 32];
+
+    let result = (|| -> Result<bool, String> {
+        let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+
+        let current_kdf = current_kdf(&conn)?;
+        if current_kdf == target_kdf {
+            return Err("This key derivation mode is already active".into());
+        }
+
+        let salt_pw_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: salt_pw")?;
+        let pk_kem_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='pk_kem'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: pk_kem")?;
+        let ct_kem_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='ct_kem'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: ct_kem")?;
+        let salt_kdf_b64: String = conn
+            .query_row("SELECT value FROM meta WHERE key='salt_kdf'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .map_err(|_| "missing meta key: salt_kdf")?;
+        let current_kdf_params_json: Option<String> = conn
+            .query_row("SELECT value FROM meta WHERE key='kdf_params'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()
+            .map_err(|e| e.to_string())?;
+
+        let salt_pw = B64
+            .decode(&salt_pw_b64)
+            .map_err(|_| "salt_pw decode failed")?;
+        let salt_kdf = B64
+            .decode(&salt_kdf_b64)
+            .map_err(|_| "salt_kdf decode failed")?;
+
+        old_k1 = derive_k1_with_kdf(
+            &current_password,
+            &salt_pw,
+            current_kdf,
+            current_kdf_params_json.as_deref(),
+        )?;
+        verify_k1(&conn, &old_k1)?;
+        old_aes_key = derive_vault_key(&old_k1, &salt_kdf, &ss)?;
+
+        let mut plaintext_entries: Vec<(i64, SecretString)> = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, nonce, ciphertext, tag FROM entries ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+
+            for row in rows {
+                let (id, nonce, ciphertext, tag) = row.map_err(|e| e.to_string())?;
+                if nonce.len() != 12 || tag.len() != 16 {
+                    return Err("Entry is corrupt (invalid nonce/tag size)".into());
+                }
+                let mut nonce12 = [0u8; 12];
+                nonce12.copy_from_slice(&nonce);
+                let mut tag16 = [0u8; 16];
+                tag16.copy_from_slice(&tag);
+                let secret = decrypt_password(&old_aes_key, &nonce12, ciphertext, &tag16)?;
+                nonce12.zeroize();
+                tag16.zeroize();
+                plaintext_entries.push((id, secret));
+            }
+        }
+
+        let mut r = rng();
+        let mut new_salt_pw = [0u8; 32];
+        let mut new_salt_kdf = [0u8; 32];
+        r.fill_bytes(&mut new_salt_pw);
+        r.fill_bytes(&mut new_salt_kdf);
+
+        let new_kdf_params = default_kdf_params(target_kdf);
+        new_k1 = derive_k1_with_kdf(
+            &current_password,
+            &new_salt_pw,
+            target_kdf,
+            Some(new_kdf_params),
+        )?;
+        new_aes_key = derive_vault_key(&new_k1, &new_salt_kdf, &ss)?;
+
+        let cipher = Aes256Gcm::new_from_slice(&new_k1).map_err(|_| "cipher init failed")?;
+        let mut verifier_nonce = [0u8; 12];
+        r.fill_bytes(&mut verifier_nonce);
+        let verifier_ct = cipher
+            .encrypt(&verifier_nonce.into(), b"vault-ok".as_ref())
+            .map_err(|_| "verifier encryption failed".to_string())?;
+
+        let new_salt_pw_b64 = B64.encode(new_salt_pw);
+        let new_salt_kdf_b64 = B64.encode(new_salt_kdf);
+        let verifier_nonce_b64 = B64.encode(verifier_nonce);
+        let verifier_ct_b64 = B64.encode(&verifier_ct);
+        let manifest_input = format!(
+            "{}{}{}{}{}{}",
+            new_salt_pw_b64,
+            new_salt_kdf_b64,
+            pk_kem_b64,
+            ct_kem_b64,
+            verifier_nonce_b64,
+            verifier_ct_b64
+        );
+        let (manifest_hash_b64, manifest_sig_b64) = sign_manifest_input(&manifest_input)?;
+        let alg = format!("mlkem768|aes256gcm|hkdfsha256|{target_kdf}");
+
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        for (id, secret) in &plaintext_entries {
+            let sealed = encrypt_password(&new_aes_key, secret.expose_secret())?;
+            tx.execute(
+                r#"
+                UPDATE entries
+                SET nonce = ?1, ciphertext = ?2, tag = ?3,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?4
+                "#,
+                params![
+                    sealed.nonce.as_slice(),
+                    sealed.ciphertext.as_slice(),
+                    sealed.tag.as_slice(),
+                    id
+                ],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('salt_pw', ?1)",
+            [&new_salt_pw_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('salt_kdf', ?1)",
+            [&new_salt_kdf_b64],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('kdf', ?1)",
+            [target_kdf],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('kdf_params', ?1)",
+            [new_kdf_params],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('alg', ?1)",
+            [&alg],
         )
         .map_err(|e| e.to_string())?;
         tx.execute(
@@ -2061,6 +2424,44 @@ pub fn vault_add(
         tag: &sealed.tag,
     };
     db::add_entry(&conn, new).map_err(|e| e.to_string())
+}
+
+#[command]
+pub fn vault_update(
+    db: State<AppDb>,
+    id: i64,
+    label: String,
+    username: String,
+    password: String,
+    notes: Option<String>,
+) -> Result<EntryListItem, String> {
+    if id <= 0 {
+        return Err("Invalid id".into());
+    }
+
+    let label = validate_label(&label)?;
+    let username = validate_username(&username)?;
+    let password = validate_password(password)?;
+    let notes = validate_notes(&notes)?;
+
+    let sealed = {
+        let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
+        let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
+        encrypt_password(aes_key_ref, password.expose_secret())?
+    };
+
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let updated = NewEntry {
+        label: &label,
+        username: &username,
+        notes: notes.as_deref(),
+        nonce: &sealed.nonce,
+        ciphertext: &sealed.ciphertext,
+        tag: &sealed.tag,
+    };
+    db::update_entry(&conn, id, updated)
+        .map_err(|e| e.to_string())?
+        .ok_or("No entry found with that id".into())
 }
 
 #[command]

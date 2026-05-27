@@ -1,6 +1,11 @@
 use arboard::Clipboard;
 use secrecy::{ExposeSecret, SecretString};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::{thread, time::Duration};
 use tauri::command;
+use zeroize::Zeroizing;
+
+static CLIPBOARD_OWNER_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -75,17 +80,61 @@ pub fn copy_to_clipboard_no_history(text: &str) -> Result<(), String> {
 
 #[command]
 pub fn copy_to_clipboard(text: String) -> Result<(), String> {
-    let secret_text = SecretString::from(text);
+    set_clipboard_text(&text)
+}
+
+fn set_clipboard_text(text: &str) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        copy_to_clipboard_no_history(text)?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let secret_text = SecretString::from(text.to_string());
+        let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
+        clipboard
+            .set_text(secret_text.expose_secret())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+fn read_clipboard_text() -> Result<String, String> {
     let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
-    clipboard
-        .set_text(secret_text.expose_secret())
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    clipboard.get_text().map_err(|e| e.to_string())
 }
 
 #[command]
 pub fn get_clipboard_text() -> Result<String, String> {
-    let mut clipboard = Clipboard::new().map_err(|e| e.to_string())?;
-    let text = SecretString::from(clipboard.get_text().map_err(|e| e.to_string())?);
+    let text = SecretString::from(read_clipboard_text()?);
     Ok(text.expose_secret().to_string())
+}
+
+#[command]
+pub fn copy_secret_to_clipboard(text: String, clear_after_ms: Option<u64>) -> Result<(), String> {
+    let token = CLIPBOARD_OWNER_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let copied_text = Zeroizing::new(text);
+    set_clipboard_text(copied_text.as_str())?;
+
+    if let Some(delay_ms) = clear_after_ms {
+        if delay_ms > 0 {
+            let expected_text = Zeroizing::new(copied_text.to_string());
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(delay_ms));
+                if CLIPBOARD_OWNER_TOKEN.load(Ordering::SeqCst) != token {
+                    return;
+                }
+                match read_clipboard_text() {
+                    Ok(current) if current == expected_text.as_str() => {
+                        let _ = set_clipboard_text("");
+                    }
+                    _ => {}
+                }
+            });
+        }
+    }
+
+    Ok(())
 }

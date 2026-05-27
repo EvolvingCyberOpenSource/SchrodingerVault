@@ -12,9 +12,9 @@
       {
         "title": "Schrödinger Vault",
         "width": 1120,
-        "height": 760,
+        "height": 860,
         "minWidth": 920,
-        "minHeight": 640
+        "minHeight": 720
       }
     ],
     "security": {

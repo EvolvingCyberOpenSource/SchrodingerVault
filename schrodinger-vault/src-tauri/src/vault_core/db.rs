@@ -157,6 +157,45 @@ pub fn add_entry(conn: &Connection, e: NewEntry) -> Result<EntryListItem> {
     Ok(item)
 }
 
+pub fn update_entry(conn: &Connection, id: i64, e: NewEntry) -> Result<Option<EntryListItem>> {
+    let changed = conn.execute(
+        r#"
+        UPDATE entries
+        SET label = ?1,
+            username = ?2,
+            notes = ?3,
+            nonce = ?4,
+            ciphertext = ?5,
+            tag = ?6,
+            updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        WHERE id = ?7
+        "#,
+        params![
+            e.label,
+            e.username,
+            e.notes,
+            e.nonce,
+            e.ciphertext,
+            e.tag,
+            id
+        ],
+    )?;
+
+    if changed == 0 {
+        return Ok(None);
+    }
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, label, username, notes, created_at, updated_at
+        FROM entries
+        WHERE id = ?1
+        "#,
+    )?;
+    let item = stmt.query_row(params![id], |row| row_to_list_item(row))?;
+    Ok(Some(item))
+}
+
 pub fn delete_entry(conn: &Connection, id: i64) -> Result<usize> {
     conn.execute("DELETE FROM entries WHERE id = ?1", params![id])
 }

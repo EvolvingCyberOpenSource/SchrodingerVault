@@ -173,6 +173,139 @@ form {
     width: 100%;
 }
 
+.kdf-options {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin: 2px 0 16px;
+    padding: 0;
+    border: 0;
+}
+
+.kdf-options legend {
+    grid-column: 1 / -1;
+    margin: 0 0 8px;
+    color: var(--text-2);
+    font-size: 0.82rem;
+    font-weight: 750;
+    text-align: left;
+}
+
+.kdf-options legend span,
+.kdf-options legend small,
+.kdf-heading span,
+.kdf-heading small {
+    display: block;
+}
+
+.kdf-options legend small,
+.kdf-heading small {
+    margin-top: 3px;
+    color: var(--text-3);
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.kdf-options label {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 38px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--field);
+    color: var(--text-2);
+    font-size: 0.9rem;
+    font-weight: 750;
+    cursor: pointer;
+}
+
+.kdf-options input {
+    position: absolute;
+    opacity: 0;
+    pointer-events: none;
+}
+
+.kdf-options label:has(input:checked) {
+    border-color: var(--primary);
+    color: var(--text);
+    box-shadow: var(--focus);
+}
+
+.kdf-options-detailed {
+    grid-template-columns: 1fr;
+    gap: 9px;
+    margin: 6px 0 18px;
+}
+
+.kdf-heading {
+    grid-column: 1 / -1;
+    margin: 0 0 10px;
+    text-align: center;
+}
+
+.kdf-heading span {
+    color: var(--text);
+    font-size: 0.96rem;
+    font-weight: 750;
+}
+
+.kdf-heading small {
+    max-width: 290px;
+    margin: 5px auto 0;
+    font-size: 0.8rem;
+}
+
+.kdf-options-detailed .kdf-card {
+    justify-content: flex-start;
+    min-height: 68px;
+    padding: 11px 42px 11px 13px;
+    text-align: left;
+}
+
+.kdf-card-body {
+    display: grid;
+    gap: 3px;
+}
+
+.kdf-card-body strong {
+    color: var(--text);
+    font-size: 0.92rem;
+    line-height: 1.2;
+}
+
+.kdf-card-body small {
+    color: var(--text-3);
+    font-size: 0.78rem;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.kdf-check {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    display: grid;
+    width: 21px;
+    height: 21px;
+    place-items: center;
+    border-radius: 999px;
+    color: #F5F7FF;
+    background: linear-gradient(135deg, var(--primary), var(--accent));
+    font-size: 0.75rem;
+    font-weight: 900;
+    opacity: 0;
+    transform: translateY(-50%) scale(0.82);
+    transition: opacity .16s ease, transform .16s ease;
+}
+
+.kdf-card:has(input:checked) .kdf-check {
+    opacity: 1;
+    transform: translateY(-50%) scale(1);
+}
+
 :is(input, textarea) {
     width: 100%;
     min-height: 42px;

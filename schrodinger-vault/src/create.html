@@ -21,8 +21,28 @@
             <br />
             <br />
             <input type="password" id="confirmPassword" placeholder="Confirm Master Password" required/>
-            <br />
-            <br />
+            <fieldset class="kdf-options kdf-options-detailed" aria-labelledby="create-kdf-heading">
+                <div id="create-kdf-heading" class="kdf-heading">
+                    <span>Key derivation</span>
+                    <small>Choose how your master password protects the vault key.</small>
+                </div>
+                <label class="kdf-card">
+                    <input type="radio" name="kdf" value="argon2id" checked />
+                    <span class="kdf-card-body">
+                        <strong>Argon2id</strong>
+                        <small>Modern default with memory-hard password protection.</small>
+                    </span>
+                    <span class="kdf-check" aria-hidden="true">✓</span>
+                </label>
+                <label class="kdf-card">
+                    <input type="radio" name="kdf" value="pbkdf2-hmac-sha256" />
+                    <span class="kdf-card-body">
+                        <strong>PBKDF2-HMAC-SHA256</strong>
+                        <small>FIPS-aligned mode for compliance-focused environments.</small>
+                    </span>
+                    <span class="kdf-check" aria-hidden="true">✓</span>
+                </label>
+            </fieldset>
             <button type="submit" id="createButton">Create Master Password</button>
         </form>
         <p id="create-msg"></p>
