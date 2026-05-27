@@ -47,10 +47,6 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
-            commands::greet,
-            commands::add_person,
-            commands::list_people,
-            commands::user_exists,
             commands::vault_exists,
             commands::create_vault,
             commands::unlock_vault,
@@ -97,7 +93,6 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::debug_tamper_entry,
             #[cfg(debug_assertions)]
             commands::debug_crypto_selftest,
-            commands::setup_verifier,
             #[cfg(debug_assertions)]
             commands::debug_insert_bad_entry,
             #[cfg(debug_assertions)]

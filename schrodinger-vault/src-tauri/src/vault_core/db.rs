@@ -73,26 +73,6 @@ pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
         [],
     )?;
 
-    // test table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS person (
-           id    INTEGER PRIMARY KEY AUTOINCREMENT,
-           name  TEXT NOT NULL,
-           data  BLOB
-         )",
-        [],
-    )?;
-
-    // table for the user (legacy demo; to be deleted later)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS user (
-            id              INTEGER PRIMARY KEY CHECK (id = 1),
-            password_hash   TEXT    NOT NULL,
-            salt            BLOB    NOT NULL
-        )",
-        [],
-    )?;
-
     // TODO: remove later and replace with correct schema in another function and call that here instead
     conn.execute(
         "CREATE TABLE IF NOT EXISTS entries (

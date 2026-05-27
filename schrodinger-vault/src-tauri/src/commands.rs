@@ -220,41 +220,6 @@ fn keystore_path() -> io::Result<PathBuf> {
     Ok(dir.join("mlkem768.sk"))
 }
 
-// =========================
-// Demo / examples
-// =========================
-
-#[command]
-pub fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-#[derive(serde::Serialize)]
-pub struct Person {
-    pub id: i32,
-    pub name: String,
-}
-
-#[command]
-pub fn add_person(db: State<AppDb>, name: String) -> Result<(), String> {
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    conn.execute(
-        "INSERT INTO person (name, data) VALUES (?1, NULL)",
-        params![name],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-#[command]
-pub fn user_exists(db: State<AppDb>) -> Result<bool, String> {
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let count: i64 = conn
-        .query_row("SELECT COUNT(1) FROM user WHERE id = 1", [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
-    Ok(count > 0)
-}
-
 #[command]
 pub fn vault_exists(db: State<AppDb>) -> Result<bool, String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -286,28 +251,6 @@ pub fn vault_session_status() -> Result<VaultSessionStatus, String> {
     Ok(VaultSessionStatus {
         loaded: guard.is_some(),
     })
-}
-
-#[command]
-pub fn list_people(db: State<AppDb>) -> Result<Vec<Person>, String> {
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    let mut stmt = conn
-        .prepare("SELECT id, name FROM person ORDER BY id")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(Person {
-                id: row.get(0)?,
-                name: row.get(1)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(r.map_err(|e| e.to_string())?);
-    }
-    Ok(out)
 }
 
 // =========================
@@ -2336,57 +2279,6 @@ pub fn debug_corrupt_manifest(db: State<AppDb>) -> Result<bool, String> {
     );
 
     Ok(true)
-}
-
-#[tauri::command]
-pub fn setup_verifier(db: State<AppDb>, password: String) -> Result<(), String> {
-    use aes_gcm::{
-        aead::{rand_core::RngCore, Aead, OsRng},
-        Aes256Gcm, KeyInit,
-    };
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-    use pbkdf2::pbkdf2_hmac;
-    use sha2::Sha256;
-
-    // Get salt_pw from DB
-    let salt_pw_b64: String = {
-        let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-        conn.query_row("SELECT value FROM meta WHERE key='salt_pw'", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .map_err(|_| "missing salt_pw")?
-    };
-
-    // Decode salt and derive K1
-    let salt_pw = B64
-        .decode(&salt_pw_b64)
-        .map_err(|_| "salt_pw decode failed")?;
-    let mut k1 = [0u8; 32];
-    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt_pw, 310_000, &mut k1);
-
-    // Create verifier
-    let verifier_plain = b"vault-ok";
-    let cipher = Aes256Gcm::new_from_slice(&k1).unwrap();
-    let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let verifier_ct = cipher
-        .encrypt(&nonce.into(), verifier_plain.as_ref())
-        .unwrap();
-
-    // Store verifier in meta
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('verifier_nonce', ?1)",
-        [B64.encode(&nonce)],
-    )
-    .map_err(|_| "insert verifier_nonce failed")?;
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES ('verifier_ct', ?1)",
-        [B64.encode(&verifier_ct)],
-    )
-    .map_err(|_| "insert verifier_ct failed")?;
-
-    Ok(())
 }
 
 // Unit tests for zeroization logic
