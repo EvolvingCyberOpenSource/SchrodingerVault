@@ -56,10 +56,10 @@ fn build_app() -> tauri::Builder<tauri::Wry> {
             commands::vault_add,
             commands::vault_get,
             commands::vault_delete,
-            commands::copy_to_clipboard,
+            commands::commands_clipboard::copy_to_clipboard,
             #[cfg(target_os = "windows")]
-            commands::copy_to_clipboard_no_history,
-            commands::get_clipboard_text,
+            commands::commands_clipboard::copy_to_clipboard_no_history,
+            commands::commands_clipboard::get_clipboard_text,
             commands::vault_session_status,
             #[cfg(debug_assertions)]
             commands::debug_kem_status,
