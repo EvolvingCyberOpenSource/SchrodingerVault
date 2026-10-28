@@ -49,16 +49,26 @@ pub struct EncEntry {
 pub fn open_and_init(app: &tauri::AppHandle) -> Result<Connection> {
     let path = db_path(app);
 
-    // TODO: can get rid of this debug in the future
-    println!("SQLite DB located at: {}", path.display());
-
     // saftey check to ensure the directory where the db will be exists
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        }
     }
 
     // creates the database file (if it doesn't exist)
-    let conn = Connection::open(path)?;
+    let conn = Connection::open(&path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    }
 
     // Good defaults for desktop apps (requires rusqlite >= 0.29)
     let _ = conn.pragma_update(None, "journal_mode", &"WAL");

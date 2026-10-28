@@ -83,6 +83,14 @@ fn zeroize_aes_key() -> Result<(), &'static str> {
     Ok(())
 }
 
+pub fn try_clear_key_after_panic() {
+    match VAULT_AES_KEY.try_write() {
+        Ok(mut guard) => *guard = None,
+        Err(std::sync::TryLockError::Poisoned(error)) => *error.into_inner() = None,
+        Err(std::sync::TryLockError::WouldBlock) => {}
+    }
+}
+
 // Zeroization helpers  #new
 //
 // Why: Dropping a variable doesn't always erase its bytes from RAM. We use
@@ -143,19 +151,20 @@ fn encrypt_password(aes_key: &[u8; 32], password_utf8: &str) -> Result<SealResul
 fn decrypt_password(
     aes_key: &[u8; 32],
     nonce: &[u8; 12],
-    mut ciphertext: Vec<u8>,
+    ciphertext: Vec<u8>,
     tag: &[u8; 16],
 ) -> Result<SecretString, String> {
     let key = GenericArray::from_slice(aes_key);
     let cipher = Aes256Gcm::new(key);
     let nonce_ga = Nonce::from_slice(nonce);
     let tag_ga = GenericArray::from_slice(tag);
+    let mut ciphertext = Zeroizing::new(ciphertext);
 
     cipher
         .decrypt_in_place_detached(nonce_ga, b"", &mut ciphertext, tag_ga)
         .map_err(|_| "Couldn't decrypt entry. It may be corrupted or tampered.".to_string())?;
 
-    let password = String::from_utf8(ciphertext)
+    let password = std::str::from_utf8(&ciphertext)
         .map_err(|_| "Decrypted data was not valid UTF-8".to_string())?;
     Ok(SecretString::from(password))
 }
@@ -205,6 +214,11 @@ fn keystore_path() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no local data dir"))?;
     let dir = base.join("SchrodingerVault").join("keystore");
     fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
     Ok(dir.join("mlkem768.sk"))
 }
 
@@ -260,6 +274,9 @@ pub fn create_vault(
     kdf: Option<String>,
 ) -> Result<bool, String> {
     let master_password = SecretString::from(master_password);
+    if master_password.expose_secret().chars().count() < 10 {
+        return Err("Master password must be at least 10 characters".into());
+    }
 
     // Use the live, already-initialized connection
     let mut conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
@@ -280,7 +297,7 @@ pub fn create_vault(
     let existing_entries_count: i64 = conn
         .query_row("SELECT COUNT(1) FROM entries", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if existing_meta_count == 6 || existing_entries_count > 0 {
+    if existing_meta_count > 0 || existing_entries_count > 0 {
         return Err("A vault already exists. Unlock it or use Reset Vault from Settings.".into());
     }
 
@@ -560,16 +577,23 @@ fn recover_device_secret(db: &State<AppDb>) -> Result<[u8; 32], String> {
     Ok(ss)
 }
 
-fn kdf_iterations(kdf_params_json: Option<String>) -> u32 {
-    kdf_params_json
-        .as_deref()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-        .and_then(|v| {
-            v.get("iterations")
-                .and_then(|i| i.as_u64())
-                .map(|n| n as u32)
-        })
-        .unwrap_or(310_000)
+fn kdf_parameter(
+    params: &serde_json::Value,
+    name: &str,
+    default: u32,
+    min: u32,
+    max: u32,
+) -> Result<u32, String> {
+    let value = match params.get(name) {
+        None => u64::from(default),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("Invalid KDF parameter: {name}"))?,
+    };
+    if value < u64::from(min) || value > u64::from(max) {
+        return Err(format!("Unsupported KDF parameter: {name}"));
+    }
+    Ok(value as u32)
 }
 
 fn normalize_kdf_label(kdf: Option<&str>) -> Result<&'static str, String> {
@@ -652,31 +676,21 @@ fn derive_k1_with_kdf(
     kdf_label: &str,
     kdf_params_json: Option<&str>,
 ) -> Result<[u8; 32], String> {
+    let params_json = match kdf_params_json {
+        Some(json) => serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|_| "Invalid KDF parameters".to_string())?,
+        None => serde_json::json!({}),
+    };
+    if !params_json.is_object() {
+        return Err("Invalid KDF parameters".into());
+    }
     match normalize_kdf_label(Some(kdf_label))? {
         "argon2id" => {
-            let params_json = kdf_params_json
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            let memory_kib = params_json
-                .get("memory_kib")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(65_536) as u32;
-            let iterations = params_json
-                .get("iterations")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(3) as u32;
-            let parallelism = params_json
-                .get("parallelism")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1) as u32;
-            let out_len = params_json
-                .get("out")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(32) as usize;
-
-            if out_len != 32 {
-                return Err("Unsupported Argon2id output length".into());
-            }
+            // Bound untrusted metadata before allocating memory or performing work.
+            let memory_kib = kdf_parameter(&params_json, "memory_kib", 65_536, 8, 262_144)?;
+            let iterations = kdf_parameter(&params_json, "iterations", 3, 1, 10)?;
+            let parallelism = kdf_parameter(&params_json, "parallelism", 1, 1, 16)?;
+            let out_len = kdf_parameter(&params_json, "out", 32, 32, 32)? as usize;
 
             let params = Argon2Params::new(memory_kib, iterations, parallelism, Some(out_len))
                 .map_err(|e| format!("Argon2id params invalid: {e}"))?;
@@ -690,7 +704,7 @@ fn derive_k1_with_kdf(
         _ => Ok(derive_k1(
             password,
             salt_pw,
-            kdf_iterations(kdf_params_json.map(|s| s.to_string())),
+            kdf_parameter(&params_json, "iterations", 310_000, 1, 10_000_000)?,
         )),
     }
 }
@@ -713,6 +727,9 @@ fn verify_k1(conn: &Connection, k1: &[u8; 32]) -> Result<(), String> {
         .map_err(|_| "missing verifier_ct")?;
 
     let nonce = B64.decode(&nonce_b64).map_err(|_| "nonce decode failed")?;
+    if nonce.len() != 12 {
+        return Err("Invalid verifier nonce length".into());
+    }
     let ct = B64
         .decode(&ct_b64)
         .map_err(|_| "verifier_ct decode failed")?;
@@ -864,6 +881,9 @@ pub fn unlock_vault(_app: AppHandle, db: State<AppDb>, password: String) -> Resu
 
         // Decode Base64 verifier data
         let nonce = B64.decode(&nonce_b64).map_err(|_| "nonce decode failed")?;
+        if nonce.len() != 12 {
+            return Err("Invalid verifier nonce length".into());
+        }
         let ct = B64
             .decode(&ct_b64)
             .map_err(|_| "verifier_ct decode failed")?;
@@ -1570,6 +1590,7 @@ pub fn factory_reset_vault(
         let _old = std::mem::replace(&mut *guard, new_conn);
     }
 
+    lock_vault();
     Ok(true)
 }
 
@@ -2391,6 +2412,12 @@ fn validate_notes(opt: &Option<String>) -> Result<Option<String>, String> {
 #[command]
 pub fn vault_list(db: State<AppDb>) -> Result<Vec<EntryListItem>, String> {
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    list_entries_unlocked(&conn)
+}
+
+fn list_entries_unlocked(conn: &Connection) -> Result<Vec<EntryListItem>, String> {
+    let guard = get_aes_key_ref()?;
+    guard.as_ref().ok_or("Vault is locked — unlock first")?;
     db::list_entries(&conn).map_err(|e| e.to_string())
 }
 
@@ -2407,14 +2434,10 @@ pub fn vault_add(
     let password = validate_password(password)?;
     let notes = validate_notes(&notes)?;
 
-    // Uses VAULT_AES_KEY by reference
-    let sealed = {
-        let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
-        let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
-        encrypt_password(aes_key_ref, password.expose_secret())?
-    };
-
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let guard = get_aes_key_ref()?;
+    let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
+    let sealed = encrypt_password(aes_key_ref, password.expose_secret())?;
     let new = NewEntry {
         label: &label,
         username: &username,
@@ -2444,13 +2467,10 @@ pub fn vault_update(
     let password = validate_password(password)?;
     let notes = validate_notes(&notes)?;
 
-    let sealed = {
-        let guard = get_aes_key_ref().map_err(|_| "Vault is locked — unlock first")?;
-        let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
-        encrypt_password(aes_key_ref, password.expose_secret())?
-    };
-
     let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let guard = get_aes_key_ref()?;
+    let aes_key_ref = guard.as_ref().ok_or("Vault is locked — unlock first")?;
+    let sealed = encrypt_password(aes_key_ref, password.expose_secret())?;
     let updated = NewEntry {
         label: &label,
         username: &username,
@@ -2499,10 +2519,16 @@ pub fn vault_get(db: State<AppDb>, id: i64) -> Result<String, String> {
 
 #[command]
 pub fn vault_delete(db: State<AppDb>, id: i64) -> Result<(), String> {
+    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    delete_entry_unlocked(&conn, id)
+}
+
+fn delete_entry_unlocked(conn: &Connection, id: i64) -> Result<(), String> {
     if id <= 0 {
         return Err("Invalid id".into());
     }
-    let conn = db.inner().0.lock().map_err(|_| "DB lock poisoned")?;
+    let guard = get_aes_key_ref()?;
+    guard.as_ref().ok_or("Vault is locked — unlock first")?;
     let n = db::delete_entry(&conn, id).map_err(|e| e.to_string())?;
     if n == 0 {
         Err("No entry found with that id".into())

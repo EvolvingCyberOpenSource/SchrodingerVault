@@ -3,6 +3,7 @@ const { invoke } = window.__TAURI__.core;
 
 let failedAttempts = 0;
 let lockUntil = 0;
+let unlocking = false;
 const BASE_DELAY = 2000;  
 const MAX_DELAY = 60000;  
 const MAX_FAILS = 5;    
@@ -22,9 +23,10 @@ passwordInput.addEventListener("keydown", (event) => {
 // Handle the unlock form submit
 form.addEventListener("submit", async (e) => {
   e.preventDefault();          // stop normal form refreshs
+  if (unlocking || failedAttempts >= MAX_FAILS) return;
   msg.textContent = "";        // clear any previous message
 
-  const pw = passwordInput.value; // get typed password
+  let pw = passwordInput.value; // get typed password
 
   try {
 
@@ -37,6 +39,9 @@ form.addEventListener("submit", async (e) => {
 
 
     // try unlocking the vault
+    unlocking = true;
+    unlockBtn.disabled = true;
+    passwordInput.value = "";
     await invoke("unlock_vault", { password: pw });
 
     // redirect to entries page if no failures
@@ -84,7 +89,7 @@ form.addEventListener("submit", async (e) => {
     // Disable unlock button during the wait
     unlockBtn.disabled = true;
     setTimeout(() => {
-        unlockBtn.disabled = false;
+        if (failedAttempts < MAX_FAILS && !unlocking) unlockBtn.disabled = false;
     }, delay);
 
     //
@@ -95,5 +100,8 @@ form.addEventListener("submit", async (e) => {
             "Too many failed attempts — restart the app to try again.";
         unlockBtn.disabled = true;
     }
+  } finally {
+    pw = "";
+    unlocking = false;
   }
 });

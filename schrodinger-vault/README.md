@@ -4,6 +4,8 @@ Schrodinger Vault is an open-source, local-first encrypted vault application bui
 
 This project is currently an early release. It is intended for local password and secret storage experiments, education, and continued security review. It has not completed an independent security audit and should not be described as FIPS validated.
 
+For the desktop Password Manager 0.1.1 fixes, test coverage, and remaining limitations, see [the maintenance release notes](docs/RELEASE_0.1.1.md). This repository is separate from the [application Secret Manager](https://github.com/EvolvingCyberOpenSource/SchrodingerVault-SecretManager).
+
 ## Platform Support
 
 - macOS Universal: Apple Silicon and Intel

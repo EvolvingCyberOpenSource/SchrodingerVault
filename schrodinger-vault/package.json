@@ -1,9 +1,10 @@
 {
   "name": "schrodinger-vault",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
+    "test:forms": "node --test tests/forms.test.mjs",
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
