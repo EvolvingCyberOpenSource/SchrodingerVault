@@ -16,10 +16,11 @@ use std::panic;
 use ctrlc;
 
 fn install_panic_hook() {
-    panic::set_hook(Box::new(|info| {
-        eprintln!("Application panicked: {info}");
-        commands::lock_vault();
-        let default_hook = panic::take_hook();
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |info| {
+        // A panic may occur while the current thread owns the key lock.
+        // Cleanup must not block on that lock or call a clipboard service.
+        commands::try_clear_key_after_panic();
         default_hook(info);
     }));
 }

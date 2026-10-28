@@ -2,6 +2,9 @@ use super::*;
 use std::{thread, time::Duration};
 use zeroize::Zeroize;
 
+// These tests share the production in-memory key slot.
+static SESSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn verifier_conn_with_kdf(
     password: &str,
     kdf: &str,
@@ -72,6 +75,7 @@ fn wipe_secret_overwrites_buffer() {
 
 #[test]
 fn aes_key_install_and_zeroize() {
+    let _serial = SESSION_TEST_LOCK.lock().unwrap();
     let key = [0xABu8; 32];
     install_aes_key(&key).expect("install key");
 
@@ -131,6 +135,7 @@ fn clipboard_auto_clear_mock() {
 
 #[test]
 fn repeated_aes_key_wipe_safe() {
+    let _serial = SESSION_TEST_LOCK.lock().unwrap();
     let key = [0xCDu8; 32];
     install_aes_key(&key).expect("install");
     zeroize_aes_key().expect("wipe #1");
@@ -150,6 +155,75 @@ fn master_password_verifier_rejects_wrong_password() {
     let (conn, _) = verifier_conn("correct horse battery staple");
     let wrong_password = SecretString::from("wrong horse battery staple".to_string());
     assert!(verify_master_password(&conn, &wrong_password).is_err());
+}
+
+#[test]
+fn invalid_verifier_nonce_is_rejected_without_panicking() {
+    let (conn, password) = verifier_conn("synthetic test password");
+    for length in [0, 1, 11, 13, 32] {
+        conn.execute(
+            "UPDATE meta SET value=?1 WHERE key='verifier_nonce'",
+            [B64.encode(vec![0u8; length])],
+        )
+        .unwrap();
+        assert!(verify_master_password(&conn, &password)
+            .unwrap_err()
+            .contains("nonce length"));
+    }
+}
+
+#[test]
+fn untrusted_kdf_costs_are_bounded_before_derivation() {
+    let password = SecretString::from("synthetic password");
+    for (algorithm, params) in [
+        ("pbkdf2-hmac-sha256", r#"{"iterations":0}"#),
+        ("pbkdf2-hmac-sha256", r#"{"iterations":4294967297}"#),
+        ("argon2id", r#"{"memory_kib":4294967296}"#),
+        ("argon2id", r#"{"iterations":100000}"#),
+        ("argon2id", r#"{"parallelism":0}"#),
+        ("argon2id", r#"{"out":64}"#),
+        ("argon2id", r#"{"memory_kib":"invalid"}"#),
+        ("argon2id", "[]"),
+        ("argon2id", "not json"),
+    ] {
+        assert!(derive_k1_with_kdf(&password, &[0; 32], algorithm, Some(params)).is_err());
+    }
+}
+
+#[test]
+fn locked_vault_cannot_list_or_delete_entries() {
+    let _serial = SESSION_TEST_LOCK.lock().unwrap();
+    zeroize_aes_key().unwrap();
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE entries (id INTEGER PRIMARY KEY, label TEXT, username TEXT, notes TEXT, created_at TEXT, updated_at TEXT); INSERT INTO entries VALUES(1, 'synthetic', 'test', NULL, '', '');").unwrap();
+    assert!(list_entries_unlocked(&conn)
+        .err()
+        .unwrap()
+        .contains("locked"));
+    assert!(delete_entry_unlocked(&conn, 1)
+        .unwrap_err()
+        .contains("locked"));
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM entries", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    install_aes_key(&[42; 32]).unwrap();
+    assert_eq!(list_entries_unlocked(&conn).unwrap().len(), 1);
+    delete_entry_unlocked(&conn, 1).unwrap();
+    zeroize_aes_key().unwrap();
+}
+
+#[test]
+fn panic_key_cleanup_does_not_deadlock_on_held_lock() {
+    let _serial = SESSION_TEST_LOCK.lock().unwrap();
+    install_aes_key(&[42; 32]).unwrap();
+    let guard = VAULT_AES_KEY.read().unwrap();
+    try_clear_key_after_panic();
+    assert!(guard.is_some());
+    drop(guard);
+    try_clear_key_after_panic();
+    assert!(VAULT_AES_KEY.read().unwrap().is_none());
 }
 
 #[test]

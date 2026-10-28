@@ -1,6 +1,7 @@
 const { invoke } = window.__TAURI__.core;
 const createMessage = document.querySelector("#create-msg");
 const passwordForm = document.querySelector("#passwordForm");
+let creatingVault = false;
 
 function submitOnEnter(input, form) {
   input.addEventListener("keydown", (event) => {
@@ -42,12 +43,18 @@ submitOnEnter(document.querySelector("#confirmPassword"), passwordForm);
 
 passwordForm.addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (creatingVault) return;
 
-  const password = document.querySelector("#masterPassword").value;
-  const confirm_Password = document.querySelector("#confirmPassword").value;
+  let password = document.querySelector("#masterPassword").value;
+  let confirm_Password = document.querySelector("#confirmPassword").value;
   const kdf = document.querySelector('input[name="kdf"]:checked')?.value ?? "argon2id";
 
   if (!validatePassword(password, confirm_Password)) return;
+  creatingVault = true;
+  const submitButton = passwordForm.querySelector('button[type="submit"]');
+  if (submitButton) submitButton.disabled = true;
+  document.querySelector("#masterPassword").value = "";
+  document.querySelector("#confirmPassword").value = "";
 
   try {
     await invoke("create_vault", { masterPassword: password, kdf });
@@ -55,5 +62,10 @@ passwordForm.addEventListener("submit", async (e) => {
   } catch (e) {
     console.error(e);
     createMessage.textContent = `Failed to create vault: ${String(e)}`;
+  } finally {
+    password = "";
+    confirm_Password = "";
+    creatingVault = false;
+    if (submitButton) submitButton.disabled = false;
   }
 });
